@@ -1,10 +1,58 @@
-[package]
-name = "off-quant"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "2"
+members = ["crates/*"]
 
-[dependencies]
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/you/off-quant"
+
+[workspace.dependencies]
+# Shared dependencies
 anyhow = "1"
-clap = { version = "4", features = ["derive", "env"] }
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+libc = "0.2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# macOS menu bar (only for ollama-bar)
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = [
+    "NSString",
+    "NSThread",
+    "NSNotification",
+    "NSObject",
+    "NSRunLoop",
+    "NSTimer",
+    "NSGeometry",
+    "NSValue",
+] }
+objc2-app-kit = { version = "0.2", features = [
+    "NSApplication",
+    "NSMenu",
+    "NSMenuItem",
+    "NSStatusBar",
+    "NSStatusItem",
+    "NSStatusBarButton",
+    "NSImage",
+    "NSButton",
+    "NSControl",
+    "NSResponder",
+    "NSView",
+    "NSRunningApplication",
+    "NSAlert",
+    "NSTextField",
+    "NSWindow",
+    "NSCell",
+    "NSText",
+    "NSPanel",
+] }
+block2 = "0.5"

@@ -1,0 +1,208 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+  APP_NAME: OllamaBar
+  BUNDLE_ID: com.offquant.ollamabar
+
+jobs:
+  build-and-release:
+    name: Build, Sign, Notarize & Release
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Get version from tag
+        id: version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version $VERSION"
+
+      - name: Update version in Cargo.toml
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          sed -i '' "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+          # Update workspace packages
+          for crate in crates/*/Cargo.toml; do
+            if grep -q "version.workspace = true" "$crate"; then
+              echo "Crate $crate uses workspace version"
+            fi
+          done
+
+      - name: Build release
+        run: cargo build --release -p ollama-bar
+
+      - name: Create app bundle
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+
+          mkdir -p dist/$APP_NAME.app/Contents/MacOS
+          mkdir -p dist/$APP_NAME.app/Contents/Resources
+
+          # Copy binary
+          cp target/release/ollama-bar dist/$APP_NAME.app/Contents/MacOS/
+
+          # Copy and update Info.plist with version
+          sed -e "s/<string>0.1.0<\/string>/<string>$VERSION<\/string>/g" \
+              crates/ollama-bar/assets/Info.plist > dist/$APP_NAME.app/Contents/Info.plist
+
+          # Copy icon if exists
+          if [ -f crates/ollama-bar/assets/AppIcon.icns ]; then
+            cp crates/ollama-bar/assets/AppIcon.icns dist/$APP_NAME.app/Contents/Resources/
+          fi
+
+      - name: Import signing certificate
+        if: env.MACOS_CERTIFICATE != ''
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          # Create temporary keychain
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          # Import certificate
+          echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+          security import certificate.p12 -k $KEYCHAIN_PATH -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security list-keychain -d user -s $KEYCHAIN_PATH
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          rm certificate.p12
+
+      - name: Sign app bundle
+        if: env.MACOS_CERTIFICATE != ''
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          SIGNING_IDENTITY: ${{ secrets.SIGNING_IDENTITY }}
+        run: |
+          codesign --force --options runtime \
+            --sign "$SIGNING_IDENTITY" \
+            --entitlements crates/ollama-bar/assets/entitlements.plist \
+            dist/$APP_NAME.app
+
+          # Verify signature
+          codesign --verify --verbose=4 dist/$APP_NAME.app
+
+      - name: Notarize app
+        if: env.APPLE_ID != ''
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          # Create zip for notarization
+          ditto -c -k --keepParent dist/$APP_NAME.app dist/$APP_NAME-notarize.zip
+
+          # Submit for notarization
+          xcrun notarytool submit dist/$APP_NAME-notarize.zip \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --wait
+
+          # Staple the ticket
+          xcrun stapler staple dist/$APP_NAME.app
+
+          rm dist/$APP_NAME-notarize.zip
+
+      - name: Create DMG
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+
+          hdiutil create -volname "$APP_NAME" \
+            -srcfolder dist/$APP_NAME.app \
+            -ov -format UDZO \
+            dist/$APP_NAME-$VERSION.dmg
+
+          # Sign DMG if certificate available
+          if [ -n "${{ secrets.SIGNING_IDENTITY }}" ]; then
+            codesign --force --sign "${{ secrets.SIGNING_IDENTITY }}" dist/$APP_NAME-$VERSION.dmg
+          fi
+
+      - name: Create ZIP archive
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          cd dist
+          zip -r $APP_NAME-$VERSION.zip $APP_NAME.app
+
+      - name: Generate checksums
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          cd dist
+          shasum -a 256 $APP_NAME-$VERSION.dmg > checksums.txt
+          shasum -a 256 $APP_NAME-$VERSION.zip >> checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: OllamaBar v${{ steps.version.outputs.version }}
+          body: |
+            ## OllamaBar v${{ steps.version.outputs.version }}
+
+            Native macOS menu bar app for managing local LLMs with Ollama.
+
+            ### Installation
+
+            1. Download `OllamaBar-${{ steps.version.outputs.version }}.dmg`
+            2. Open the DMG and drag OllamaBar to Applications
+            3. Launch from Applications or Spotlight
+
+            ### Features
+            - One-click Ollama start/stop/restart
+            - Model switching from menu bar
+            - Tailscale network sharing
+            - Memory usage monitoring
+            - Native macOS notifications
+
+            ### Requirements
+            - macOS 13.0 or later
+            - [Ollama](https://ollama.ai) installed
+
+            ### Checksums
+            ```
+            $(cat dist/checksums.txt)
+            ```
+          files: |
+            dist/OllamaBar-${{ steps.version.outputs.version }}.dmg
+            dist/OllamaBar-${{ steps.version.outputs.version }}.zip
+            dist/checksums.txt
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload unsigned artifact (fallback)
+        if: env.MACOS_CERTIFICATE == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: OllamaBar-${{ steps.version.outputs.version }}-unsigned
+          path: |
+            dist/OllamaBar-${{ steps.version.outputs.version }}.dmg
+            dist/OllamaBar-${{ steps.version.outputs.version }}.zip
+          retention-days: 30
