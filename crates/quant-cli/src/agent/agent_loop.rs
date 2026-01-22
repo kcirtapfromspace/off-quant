@@ -3,9 +3,10 @@
 use std::io::{stdout, Write};
 
 use anyhow::Result;
+use futures::StreamExt;
 use llm_core::{
     ChatMessageWithTools, ChatOptions, FunctionDefinition as LlmFunctionDefinition, OllamaClient,
-    Role, ToolDefinition as OllamaToolDefinition,
+    Role, ToolCall as LlmToolCall, ToolDefinition as OllamaToolDefinition,
 };
 use tracing::{debug, info, instrument, warn};
 
@@ -111,21 +112,13 @@ impl AgentLoop {
                 stdout().flush()?;
             }
 
-            // Call the LLM with tools
-            debug!("Calling LLM with tools");
+            // Call the LLM with streaming
+            debug!("Calling LLM with tools (streaming)");
 
-            // Show spinner during LLM thinking
-            let mut spinner = if self.config.verbose {
-                let mut s = Spinner::new("Thinking...");
-                s.start();
-                Some(s)
-            } else {
-                None
-            };
-
-            let response = self
+            // Get streaming response
+            let stream_result = self
                 .client
-                .chat_with_tools(
+                .chat_stream_with_tools(
                     &self.config.model,
                     &state.messages,
                     Some(&tool_defs),
@@ -133,13 +126,8 @@ impl AgentLoop {
                 )
                 .await;
 
-            // Stop spinner
-            if let Some(ref mut s) = spinner {
-                s.stop().await;
-            }
-
-            let response = match response {
-                Ok(r) => r,
+            let mut stream = match stream_result {
+                Ok(s) => s,
                 Err(e) => {
                     warn!(error = %e, "LLM request failed");
                     state.mark_error(format!("LLM error: {}", e));
@@ -147,42 +135,80 @@ impl AgentLoop {
                 }
             };
 
-            let message = response.message;
+            // Accumulate response from stream
+            let mut content = String::new();
+            let mut tool_calls: Vec<LlmToolCall> = Vec::new();
+            let mut started_output = false;
+
+            // Process stream chunks
+            while let Some(chunk_result) = stream.next().await {
+                let chunk = match chunk_result {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!(error = %e, "Stream error");
+                        state.mark_error(format!("Stream error: {}", e));
+                        break;
+                    }
+                };
+
+                // Extract content from chunk
+                if let Some(ref msg) = chunk.message {
+                    // Print streaming content
+                    if !msg.content.is_empty() && self.config.verbose {
+                        if !started_output {
+                            println!(); // Start on new line
+                            started_output = true;
+                        }
+                        print!("{}", msg.content);
+                        stdout().flush()?;
+                    }
+                    content.push_str(&msg.content);
+
+                    // Collect tool calls (usually in final chunk)
+                    if !msg.tool_calls.is_empty() {
+                        tool_calls.extend(msg.tool_calls.clone());
+                    }
+                }
+
+                // Check if done
+                if chunk.done {
+                    break;
+                }
+            }
+
+            // Finish output line if we printed content
+            if started_output && self.config.verbose {
+                println!();
+            }
 
             // Check if LLM wants to call tools
-            if message.tool_calls.is_empty() {
+            if tool_calls.is_empty() {
                 // No tool calls - LLM is done
                 info!(iterations = state.iteration, "Agent completed task");
                 if self.config.verbose {
                     println!("{}Done{}", GREEN, RESET);
                 }
-                state.mark_finished(message.content.clone());
+                state.mark_finished(content.clone());
                 state.add_message(ChatMessageWithTools {
                     role: Role::Assistant,
-                    content: message.content,
+                    content,
                     tool_calls: None,
                     tool_call_id: None,
                 });
                 break;
             }
 
-            // Print assistant's thinking if present
-            if !message.content.is_empty() && self.config.verbose {
-                println!();
-                println!("{}{}{}", DIM, message.content, RESET);
-            }
-
             // Add assistant message with tool calls
             state.add_message(ChatMessageWithTools {
                 role: Role::Assistant,
-                content: message.content.clone(),
-                tool_calls: Some(message.tool_calls.clone()),
+                content: content.clone(),
+                tool_calls: Some(tool_calls.clone()),
                 tool_call_id: None,
             });
 
             // Execute each tool call
-            debug!(tool_count = message.tool_calls.len(), "Processing tool calls");
-            for tool_call in &message.tool_calls {
+            debug!(tool_count = tool_calls.len(), "Processing tool calls");
+            for tool_call in &tool_calls {
                 let call = ToolCall {
                     name: tool_call.function.name.clone(),
                     arguments: tool_call.function.arguments.clone(),
