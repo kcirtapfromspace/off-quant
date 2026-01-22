@@ -22,19 +22,46 @@ install-just:
 install-deps:
     pip install tomli  # For Python < 3.11
 
+# Build the quant CLI
+build-cli:
+    cargo build --release -p quant-cli
+    @echo "Built: target/release/quant"
+
 # Full setup
-setup: install-ollama install-deps
+setup: install-ollama build-cli
     @echo "Setup complete!"
     @echo "Next steps:"
     @echo "  1. Mount your models volume at /Volumes/models"
-    @echo "  2. Run: just serve"
-    @echo "  3. Run: just import"
+    @echo "  2. Run: quant serve start"
+    @echo "  3. Run: quant import"
+
+# === Quant CLI (New) ===
+
+# Start interactive chat
+chat model="":
+    @if [ -n "{{model}}" ]; then \
+        cargo run --release -p quant-cli -- chat --model {{model}}; \
+    else \
+        cargo run --release -p quant-cli -- chat; \
+    fi
+
+# One-shot query
+ask +prompt:
+    cargo run --release -p quant-cli -- ask {{prompt}}
 
 # === Ollama Service ===
 
-# Start Ollama (foreground)
+# Start Ollama (foreground) - uses new CLI
 serve:
-    python3 scripts/llm_ctl.py serve
+    cargo run --release -p quant-cli -- serve start --foreground
+
+# Start Ollama (background)
+serve-bg:
+    cargo run --release -p quant-cli -- serve start
+
+# Stop Ollama
+serve-stop:
+    cargo run --release -p quant-cli -- serve stop
 
 # Start Ollama as launchd service
 service-install:
@@ -59,33 +86,63 @@ logs:
 
 # === Model Management ===
 
-# Show status
+# Show status - uses new CLI
 status:
+    cargo run --release -p quant-cli -- status
+
+# Health check (for scripts) - uses new CLI
+health timeout="60":
+    cargo run --release -p quant-cli -- health -t {{timeout}}
+
+# List all models - uses new CLI
+models:
+    cargo run --release -p quant-cli -- models list
+
+# Show running models
+models-ps:
+    cargo run --release -p quant-cli -- models ps
+
+# Import local GGUF files - uses new CLI
+import:
+    cargo run --release -p quant-cli -- import
+
+# Pull a model from registry - uses new CLI
+pull model:
+    cargo run --release -p quant-cli -- models pull {{model}}
+
+# Remove a model
+rm model:
+    cargo run --release -p quant-cli -- models rm {{model}}
+
+# Auto-select model based on RAM - uses new CLI
+select:
+    cargo run --release -p quant-cli -- select
+
+# Generate .env.local - uses new CLI
+env:
+    cargo run --release -p quant-cli -- env
+
+# === Legacy Python Commands (for backward compatibility) ===
+
+# Show status (legacy)
+status-py:
     python3 scripts/llm_ctl.py status
 
-# Health check (for scripts)
-health timeout="60":
+# Health check (legacy)
+health-py timeout="60":
     python3 scripts/llm_ctl.py health -t {{timeout}}
 
-# List all models
-models:
+# List models (legacy)
+models-py:
     python3 scripts/llm_ctl.py models
 
-# Import local GGUF files
-import:
+# Import (legacy)
+import-py:
     python3 scripts/llm_ctl.py import
 
-# Pull a model from registry
-pull model:
-    python3 scripts/llm_ctl.py pull {{model}}
-
-# Auto-select model based on RAM
-select:
-    python3 scripts/llm_ctl.py select
-
-# Generate .env.local
-env:
-    python3 scripts/llm_ctl.py env
+# Serve (legacy)
+serve-py:
+    python3 scripts/llm_ctl.py serve
 
 # === Network Proxy ===
 
