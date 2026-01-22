@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 llm-core = { path = "../llm-core" }
 anyhow.workspace = true
+dirs = "5"
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -22,6 +23,10 @@ objc2.workspace = true
 objc2-foundation.workspace = true
 objc2-app-kit.workspace = true
 block2.workspace = true
+
+# Cross-platform tray icon (works reliably on macOS)
+tray-icon = "0.21"
+muda = "0.17"  # Menu library used with tray-icon (must match tray-icon's dep)
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # macOS-specific if needed

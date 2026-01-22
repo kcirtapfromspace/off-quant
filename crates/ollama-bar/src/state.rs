@@ -25,6 +25,9 @@ struct AppStateInner {
 
     // Settings
     tailscale_sharing: bool,
+
+    // Remember last used model
+    last_model: Option<String>,
 }
 
 impl AppState {
@@ -34,6 +37,9 @@ impl AppState {
         let tailscale_client = TailscaleClient::new();
 
         let memory_total_gb = Config::system_ram_gb()? as f64;
+
+        // Load last model from persistent storage
+        let last_model = Self::load_last_model();
 
         Ok(Self {
             inner: Arc::new(Mutex::new(AppStateInner {
@@ -47,8 +53,25 @@ impl AppState {
                 memory_used_gb: 0.0,
                 memory_total_gb,
                 tailscale_sharing: false,
+                last_model,
             })),
         })
+    }
+
+    /// Load last model from persistent storage
+    fn load_last_model() -> Option<String> {
+        let path = dirs::cache_dir()?.join("ollama-bar").join("last_model");
+        std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+    }
+
+    /// Save last model to persistent storage
+    fn save_last_model(model: &str) {
+        if let Some(cache_dir) = dirs::cache_dir() {
+            let dir = cache_dir.join("ollama-bar");
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("last_model");
+            let _ = std::fs::write(path, model);
+        }
     }
 
     /// Refresh all status information
@@ -77,14 +100,27 @@ impl AppState {
         // Check Tailscale status
         let tailscale_status = tailscale_client.status();
 
+        // Check if tailscale serve is actually active
+        let tailscale_sharing = self.is_tailscale_serving();
+
         // Update state
         {
             let mut inner = self.inner.lock().unwrap();
             inner.ollama_status = ollama_status;
             inner.tailscale_status = tailscale_status;
+
+            // Track last model - save when current model changes
+            if let Some(ref model) = current_model {
+                if inner.current_model.as_ref() != Some(model) {
+                    inner.last_model = Some(model.clone());
+                    Self::save_last_model(model);
+                }
+            }
+
             inner.current_model = current_model;
             inner.available_models = available_models;
             inner.memory_used_gb = memory_used;
+            inner.tailscale_sharing = tailscale_sharing;
         }
 
         Ok(())
@@ -104,6 +140,10 @@ impl AppState {
         self.inner.lock().unwrap().current_model.clone()
     }
 
+    pub fn last_model(&self) -> Option<String> {
+        self.inner.lock().unwrap().last_model.clone()
+    }
+
     pub fn available_models(&self) -> Vec<String> {
         self.inner.lock().unwrap().available_models.clone()
     }
@@ -117,6 +157,7 @@ impl AppState {
         self.inner.lock().unwrap().tailscale_sharing
     }
 
+    #[allow(dead_code)]
     pub fn tailscale_ip(&self) -> Option<String> {
         let inner = self.inner.lock().unwrap();
         if inner.tailscale_status == TailscaleStatus::Connected {
@@ -133,8 +174,14 @@ impl AppState {
 
     // Actions
 
+    /// Get the path to the Ollama log file
+    pub fn ollama_log_path() -> std::path::PathBuf {
+        std::path::PathBuf::from("/tmp/ollama.log")
+    }
+
     pub async fn start_ollama(&self) -> anyhow::Result<()> {
-        use std::process::Command;
+        use std::fs::File;
+        use std::process::{Command, Stdio};
 
         let (host, port, ollama_home) = {
             let inner = self.inner.lock().unwrap();
@@ -152,10 +199,19 @@ impl AppState {
 
         tracing::info!("Starting Ollama at {}:{}", host, port);
 
+        // Create log file for Ollama output
+        let log_path = Self::ollama_log_path();
+        let log_file = File::create(&log_path)?;
+        let log_file_err = log_file.try_clone()?;
+
+        tracing::info!("Ollama logs will be written to: {:?}", log_path);
+
         Command::new("ollama")
             .arg("serve")
             .env("OLLAMA_HOST", format!("{}:{}", host, port))
             .env("OLLAMA_HOME", &ollama_home)
+            .stdout(Stdio::from(log_file))
+            .stderr(Stdio::from(log_file_err))
             .spawn()?;
 
         // Wait for health
@@ -169,6 +225,18 @@ impl AppState {
         }
 
         anyhow::bail!("Ollama failed to start within 30 seconds")
+    }
+
+    /// Start Ollama and load a specific model
+    pub async fn start_ollama_with_model(&self, model: &str) -> anyhow::Result<()> {
+        // First start Ollama
+        self.start_ollama().await?;
+
+        // Then load the model
+        tracing::info!("Loading model after start: {}", model);
+        self.switch_model(model).await?;
+
+        Ok(())
     }
 
     pub fn stop_ollama(&self) -> anyhow::Result<()> {
@@ -198,19 +266,105 @@ impl AppState {
         Ok(())
     }
 
-    pub fn toggle_tailscale_sharing(&self) -> anyhow::Result<()> {
-        let mut inner = self.inner.lock().unwrap();
+    pub async fn pull_model(&self, model: &str) -> anyhow::Result<()> {
+        let client = self.inner.lock().unwrap().ollama_client.clone();
 
-        if inner.tailscale_status != TailscaleStatus::Connected {
+        tracing::info!("Pulling model: {}", model);
+        client.pull_model_blocking(model).await?;
+        tracing::info!("Model pulled: {}", model);
+
+        Ok(())
+    }
+
+    pub fn toggle_tailscale_sharing(&self) -> anyhow::Result<()> {
+        use std::process::Command;
+
+        let tailscale_status = {
+            let inner = self.inner.lock().unwrap();
+            inner.tailscale_status
+        };
+
+        if tailscale_status != TailscaleStatus::Connected {
             anyhow::bail!("Tailscale is not connected");
         }
 
-        inner.tailscale_sharing = !inner.tailscale_sharing;
+        let currently_sharing = self.is_tailscale_serving();
 
-        // TODO: Restart Ollama with different OLLAMA_HOST binding
-        // For now, just toggle the flag
+        if currently_sharing {
+            // Disable tailscale serve
+            tracing::info!("Disabling Tailscale serve");
+            let output = Command::new("tailscale")
+                .args(["serve", "--https=443", "off"])
+                .output()?;
 
-        tracing::info!("Tailscale sharing: {}", inner.tailscale_sharing);
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::error!("Failed to disable tailscale serve: {}", stderr);
+                anyhow::bail!("Failed to disable tailscale serve");
+            }
+
+            self.inner.lock().unwrap().tailscale_sharing = false;
+        } else {
+            // Enable tailscale serve on port 11434
+            tracing::info!("Enabling Tailscale serve on port 11434");
+            let output = Command::new("tailscale")
+                .args(["serve", "--bg", "11434"])
+                .output()?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::error!("Failed to enable tailscale serve: {}", stderr);
+                anyhow::bail!("Failed to enable tailscale serve");
+            }
+
+            self.inner.lock().unwrap().tailscale_sharing = true;
+        }
+
+        tracing::info!("Tailscale sharing: {}", !currently_sharing);
         Ok(())
+    }
+
+    /// Check if tailscale serve is currently active
+    fn is_tailscale_serving(&self) -> bool {
+        use std::process::Command;
+
+        let output = Command::new("tailscale")
+            .args(["serve", "status"])
+            .output();
+
+        match output {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                // If there's serve config, it will show proxy info
+                stdout.contains("proxy") || stdout.contains("http")
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Get the tailscale serve URL if active
+    pub fn tailscale_serve_url(&self) -> Option<String> {
+        use std::process::Command;
+
+        let output = Command::new("tailscale")
+            .args(["serve", "status", "--json"])
+            .output()
+            .ok()?;
+
+        if output.status.success() {
+            let _stdout = String::from_utf8_lossy(&output.stdout);
+            // Parse the serve URL from status
+            // For now, construct it from the hostname
+            if let Ok(dns_output) = Command::new("tailscale").args(["status", "--json"]).output() {
+                let dns_stdout = String::from_utf8_lossy(&dns_output.stdout);
+                if let Ok(status) = serde_json::from_str::<serde_json::Value>(&dns_stdout) {
+                    if let Some(dns_name) = status["Self"]["DNSName"].as_str() {
+                        let dns_name = dns_name.trim_end_matches('.');
+                        return Some(format!("https://{}", dns_name));
+                    }
+                }
+            }
+        }
+        None
     }
 }

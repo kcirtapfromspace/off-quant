@@ -123,6 +123,7 @@ impl UserConfig {
     }
 
     /// Save configuration to default location
+    #[allow(dead_code)]
     pub fn save(&self) -> Result<PathBuf> {
         let path = Self::config_path()?;
 
@@ -202,6 +203,7 @@ theme = "auto"
     }
 
     /// Resolve a model name (check aliases first)
+    #[allow(dead_code)]
     pub fn resolve_model(&self, name: &str) -> String {
         self.aliases
             .models
