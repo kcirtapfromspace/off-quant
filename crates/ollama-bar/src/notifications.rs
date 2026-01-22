@@ -11,9 +11,7 @@ pub fn send_notification(title: &str, message: &str) {
         title.replace('"', "\\\"")
     );
 
-    let _ = Command::new("osascript")
-        .args(["-e", &script])
-        .spawn();
+    let _ = Command::new("osascript").args(["-e", &script]).spawn();
 
     tracing::debug!("Notification: {} - {}", title, message);
 }
@@ -41,10 +39,16 @@ impl Notification {
                 return send_notification("Model Loaded", &format!("{} is ready", name));
             }
             Notification::ModelDownloadComplete(name) => {
-                return send_notification("Download Complete", &format!("{} is ready to use", name));
+                return send_notification(
+                    "Download Complete",
+                    &format!("{} is ready to use", name),
+                );
             }
             Notification::ModelDownloadFailed(name) => {
-                return send_notification("Download Failed", &format!("Failed to download {}", name));
+                return send_notification(
+                    "Download Failed",
+                    &format!("Failed to download {}", name),
+                );
             }
             Notification::TailscaleEnabled(url) => {
                 return send_notification("Tailscale Sharing", &format!("Available at {}", url));
