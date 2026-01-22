@@ -6,8 +6,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use futures::StreamExt;
 use llm_core::{
-    ChatMessageWithTools, ChatOptions, FunctionDefinition as LlmFunctionDefinition, OllamaClient,
-    Role, ToolCall as LlmToolCall, ToolDefinition as OllamaToolDefinition,
+    ChatMessageWithTools, ChatOptions, FunctionCall as LlmFunctionCall,
+    FunctionDefinition as LlmFunctionDefinition, OllamaClient, Role, ToolCall as LlmToolCall,
+    ToolDefinition as OllamaToolDefinition,
 };
 use tokio::sync::Mutex;
 use tracing::{debug, info, instrument, warn};
@@ -341,6 +342,18 @@ impl AgentLoop {
             }
 
             // Check if LLM wants to call tools
+            // First check native tool_calls, then fallback to parsing JSON from content
+            if tool_calls.is_empty() {
+                // Try to parse JSON tool calls from content (for models that don't use native tool calling)
+                if let Some(parsed_calls) = parse_json_tool_calls(&content) {
+                    debug!(
+                        count = parsed_calls.len(),
+                        "Parsed tool calls from content JSON"
+                    );
+                    tool_calls = parsed_calls;
+                }
+            }
+
             if tool_calls.is_empty() {
                 // No tool calls - LLM is done
                 info!(iterations = state.iteration, "Agent completed task");
@@ -653,6 +666,153 @@ When you have completed the task, provide a final summary response without calli
     }
 }
 
+/// Parse JSON tool calls from content text
+///
+/// Many models output tool calls as JSON in the content field rather than using
+/// Ollama's native tool_calls mechanism. This function extracts those calls.
+///
+/// Supports:
+/// - Raw JSON: `{"name": "tool_name", "arguments": {...}}`
+/// - Markdown code blocks: ```json\n{"name": ...}\n```
+/// - Multiple tool calls (array or sequential)
+fn parse_json_tool_calls(content: &str) -> Option<Vec<LlmToolCall>> {
+    let content = content.trim();
+    if content.is_empty() {
+        return None;
+    }
+
+    // Try to extract JSON from markdown code blocks first
+    let json_content = extract_json_from_markdown(content).unwrap_or(content);
+
+    // Try parsing as a single tool call object
+    if let Some(call) = try_parse_single_tool_call(json_content) {
+        return Some(vec![call]);
+    }
+
+    // Try parsing as an array of tool calls
+    if let Some(calls) = try_parse_tool_call_array(json_content) {
+        return Some(calls);
+    }
+
+    // Try finding JSON objects in the content
+    if let Some(calls) = extract_json_objects(content) {
+        return Some(calls);
+    }
+
+    None
+}
+
+/// Extract JSON content from markdown code blocks
+fn extract_json_from_markdown(content: &str) -> Option<&str> {
+    // Match ```json ... ``` or ``` ... ```
+    let patterns = ["```json\n", "```JSON\n", "```\n"];
+
+    for pattern in patterns {
+        if let Some(start) = content.find(pattern) {
+            let json_start = start + pattern.len();
+            if let Some(end) = content[json_start..].find("```") {
+                return Some(content[json_start..json_start + end].trim());
+            }
+        }
+    }
+
+    None
+}
+
+/// Try to parse content as a single tool call
+fn try_parse_single_tool_call(content: &str) -> Option<LlmToolCall> {
+    #[derive(serde::Deserialize)]
+    struct ToolCallJson {
+        name: String,
+        arguments: serde_json::Value,
+    }
+
+    let parsed: ToolCallJson = serde_json::from_str(content).ok()?;
+
+    // Validate that name is not empty
+    if parsed.name.is_empty() {
+        return None;
+    }
+
+    Some(LlmToolCall {
+        id: uuid::Uuid::new_v4().to_string(),
+        function: LlmFunctionCall {
+            name: parsed.name,
+            arguments: parsed.arguments,
+        },
+    })
+}
+
+/// Try to parse content as an array of tool calls
+fn try_parse_tool_call_array(content: &str) -> Option<Vec<LlmToolCall>> {
+    #[derive(serde::Deserialize)]
+    struct ToolCallJson {
+        name: String,
+        arguments: serde_json::Value,
+    }
+
+    let parsed: Vec<ToolCallJson> = serde_json::from_str(content).ok()?;
+
+    if parsed.is_empty() {
+        return None;
+    }
+
+    let calls: Vec<LlmToolCall> = parsed
+        .into_iter()
+        .filter(|c| !c.name.is_empty())
+        .map(|c| LlmToolCall {
+            id: uuid::Uuid::new_v4().to_string(),
+            function: LlmFunctionCall {
+                name: c.name,
+                arguments: c.arguments,
+            },
+        })
+        .collect();
+
+    if calls.is_empty() {
+        None
+    } else {
+        Some(calls)
+    }
+}
+
+/// Extract JSON objects from content that look like tool calls
+fn extract_json_objects(content: &str) -> Option<Vec<LlmToolCall>> {
+    let mut calls = Vec::new();
+    let mut depth = 0;
+    let mut start = None;
+
+    for (i, c) in content.char_indices() {
+        match c {
+            '{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(s) = start {
+                        let json_str = &content[s..=i];
+                        if let Some(call) = try_parse_single_tool_call(json_str) {
+                            calls.push(call);
+                        }
+                    }
+                    start = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if calls.is_empty() {
+        None
+    } else {
+        Some(calls)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -687,5 +847,56 @@ mod tests {
         state.mark_finished("Done".to_string());
         assert!(state.finished);
         assert_eq!(state.final_response, Some("Done".to_string()));
+    }
+
+    #[test]
+    fn test_parse_json_tool_call_raw() {
+        let content = r#"{"name": "glob", "arguments": {"pattern": "*.rs"}}"#;
+        let calls = parse_json_tool_calls(content).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "glob");
+    }
+
+    #[test]
+    fn test_parse_json_tool_call_markdown() {
+        let content = r#"```json
+{"name": "read_file", "arguments": {"path": "/tmp/test.txt"}}
+```"#;
+        let calls = parse_json_tool_calls(content).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read_file");
+    }
+
+    #[test]
+    fn test_parse_json_tool_call_with_text() {
+        let content = r#"I'll search for that file.
+{"name": "glob", "arguments": {"pattern": "src/**/*.rs"}}
+Let me know if you need more."#;
+        let calls = parse_json_tool_calls(content).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "glob");
+    }
+
+    #[test]
+    fn test_parse_json_tool_call_array() {
+        let content = r#"[
+            {"name": "read_file", "arguments": {"path": "a.txt"}},
+            {"name": "read_file", "arguments": {"path": "b.txt"}}
+        ]"#;
+        let calls = parse_json_tool_calls(content).unwrap();
+        assert_eq!(calls.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_json_tool_call_no_match() {
+        let content = "Just a regular response with no tool calls.";
+        assert!(parse_json_tool_calls(content).is_none());
+    }
+
+    #[test]
+    fn test_extract_json_from_markdown() {
+        let content = "```json\n{\"test\": true}\n```";
+        let json = extract_json_from_markdown(content).unwrap();
+        assert_eq!(json, "{\"test\": true}");
     }
 }
