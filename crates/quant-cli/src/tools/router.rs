@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
+use tracing::{debug, info, instrument, warn};
 
 use super::registry::ToolRegistry;
 use super::security::{ConfirmationHandler, ConfirmationResult};
@@ -41,14 +42,19 @@ impl ToolRouter {
     }
 
     /// Route a single tool call
+    #[instrument(skip(self, ctx), fields(tool = %tool_call.name))]
     pub async fn route(&self, tool_call: &ToolCall, ctx: &ToolContext) -> RouteResult {
         // Look up the tool
         let tool = match self.registry.get(&tool_call.name) {
             Some(t) => t,
-            None => return RouteResult::NotFound(tool_call.name.clone()),
+            None => {
+                warn!(tool = %tool_call.name, "Tool not found");
+                return RouteResult::NotFound(tool_call.name.clone());
+            }
         };
 
         let security_level = tool.security_level();
+        debug!(security_level = %security_level, "Tool security level");
 
         // Check if confirmation is needed
         let needs_confirmation = match security_level {
@@ -58,18 +64,41 @@ impl ToolRouter {
         };
 
         if needs_confirmation {
+            debug!("Requesting user confirmation");
             match self.confirmation.confirm(tool_call, security_level).await {
-                ConfirmationResult::Approved => {}
-                ConfirmationResult::Denied => return RouteResult::Denied,
-                ConfirmationResult::Skip => return RouteResult::Skipped,
-                ConfirmationResult::Abort => return RouteResult::Aborted,
+                ConfirmationResult::Approved => {
+                    debug!("User approved tool execution");
+                }
+                ConfirmationResult::Denied => {
+                    info!(tool = %tool_call.name, "User denied tool execution");
+                    return RouteResult::Denied;
+                }
+                ConfirmationResult::Skip => {
+                    info!(tool = %tool_call.name, "User skipped tool execution");
+                    return RouteResult::Skipped;
+                }
+                ConfirmationResult::Abort => {
+                    info!(tool = %tool_call.name, "User aborted operation");
+                    return RouteResult::Aborted;
+                }
             }
         }
 
-        // Execute the tool
-        match tool.execute(tool_call.arguments.clone(), ctx).await {
-            Ok(result) => RouteResult::Success(result),
-            Err(e) => RouteResult::Error(e.to_string()),
+        // Execute the tool (pass by reference to avoid cloning)
+        info!(tool = %tool_call.name, "Executing tool");
+        match tool.execute(&tool_call.arguments, ctx).await {
+            Ok(result) => {
+                if result.success {
+                    info!(tool = %tool_call.name, output_len = result.output.len(), "Tool executed successfully");
+                } else {
+                    warn!(tool = %tool_call.name, error = ?result.error, "Tool execution failed");
+                }
+                RouteResult::Success(result)
+            }
+            Err(e) => {
+                warn!(tool = %tool_call.name, error = %e, "Tool execution error");
+                RouteResult::Error(e.to_string())
+            }
         }
     }
 
@@ -147,7 +176,7 @@ mod tests {
             ParameterSchema::new()
         }
 
-        async fn execute(&self, args: serde_json::Value, _ctx: &ToolContext) -> Result<ToolResult> {
+        async fn execute(&self, args: &serde_json::Value, _ctx: &ToolContext) -> Result<ToolResult> {
             let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("empty");
             Ok(ToolResult::success(text))
         }

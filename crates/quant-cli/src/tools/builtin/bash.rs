@@ -6,6 +6,7 @@ use serde_json::Value;
 use std::process::Stdio;
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
+use tracing::{debug, instrument, warn};
 
 use crate::tools::{ParameterProperty, ParameterSchema, SecurityLevel, Tool, ToolContext, ToolResult};
 
@@ -33,14 +34,20 @@ impl Tool for BashTool {
             .with_property("working_dir", ParameterProperty::string("Working directory for the command (default: current directory)"))
     }
 
-    async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolResult> {
+    #[instrument(skip(self, args, ctx), fields(command = tracing::field::Empty))]
+    async fn execute(&self, args: &Value, ctx: &ToolContext) -> Result<ToolResult> {
         let command = args.get("command")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: command"))?;
 
+        // Record command in span (truncate for safety)
+        tracing::Span::current().record("command", &command.chars().take(100).collect::<String>().as_str());
+
         let timeout_secs = args.get("timeout")
             .and_then(|v| v.as_u64())
-            .unwrap_or(120);
+            .unwrap_or(ctx.command_timeout_secs);
+
+        debug!(timeout_secs, default = ctx.command_timeout_secs, "Bash command timeout");
 
         let working_dir = args.get("working_dir")
             .and_then(|v| v.as_str())
@@ -52,6 +59,32 @@ impl Tool for BashTool {
             return Ok(ToolResult::error(format!(
                 "Working directory does not exist: {}",
                 working_dir.display()
+            )));
+        }
+
+        // P0 Security: Validate working_dir is within ctx.working_dir to prevent path traversal
+        let canonical_working = match working_dir.canonicalize() {
+            Ok(p) => p,
+            Err(e) => return Ok(ToolResult::error(format!(
+                "Failed to resolve working directory: {}", e
+            ))),
+        };
+        let canonical_ctx = match ctx.working_dir.canonicalize() {
+            Ok(p) => p,
+            Err(e) => return Ok(ToolResult::error(format!(
+                "Failed to resolve context directory: {}", e
+            ))),
+        };
+        if !canonical_working.starts_with(&canonical_ctx) {
+            warn!(
+                requested = %working_dir.display(),
+                allowed = %ctx.working_dir.display(),
+                "Path traversal attempt denied"
+            );
+            return Ok(ToolResult::error(format!(
+                "Path traversal denied: {} is outside allowed directory {}",
+                working_dir.display(),
+                ctx.working_dir.display()
             )));
         }
 
@@ -81,6 +114,9 @@ impl Tool for BashTool {
 
         match result {
             Ok(Ok(output)) => {
+                let exit_code = output.status.code();
+                debug!(exit_code = ?exit_code, "Command completed");
+
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -97,12 +133,19 @@ impl Tool for BashTool {
                     combined_output.push_str(&stderr);
                 }
 
-                // Truncate if too long
+                // Truncate if too long (UTF-8 safe)
                 let combined_output = if combined_output.len() > ctx.max_output_len {
+                    // Find a safe truncation point at a char boundary
+                    let safe_end = combined_output
+                        .char_indices()
+                        .take_while(|(idx, _)| *idx < ctx.max_output_len)
+                        .last()
+                        .map(|(idx, c)| idx + c.len_utf8())
+                        .unwrap_or(0);
                     format!(
                         "{}\n\n[Output truncated at {} characters]",
-                        &combined_output[..ctx.max_output_len],
-                        ctx.max_output_len
+                        &combined_output[..safe_end],
+                        safe_end
                     )
                 } else {
                     combined_output
@@ -118,11 +161,17 @@ impl Tool for BashTool {
                     ))
                 }
             }
-            Ok(Err(e)) => Ok(ToolResult::error(format!("Failed to execute command: {}", e))),
-            Err(_) => Ok(ToolResult::error(format!(
-                "Command timed out after {} seconds",
-                timeout_secs
-            ))),
+            Ok(Err(e)) => {
+                warn!(error = %e, "Failed to execute command");
+                Ok(ToolResult::error(format!("Failed to execute command: {}", e)))
+            }
+            Err(_) => {
+                warn!(timeout_secs, "Command timed out");
+                Ok(ToolResult::error(format!(
+                    "Command timed out after {} seconds",
+                    timeout_secs
+                )))
+            }
         }
     }
 }
@@ -139,7 +188,7 @@ mod tests {
         let ctx = ToolContext::default();
         let args = json!({ "command": "echo 'hello world'" });
 
-        let result = tool.execute(args, &ctx).await.unwrap();
+        let result = tool.execute(&args, &ctx).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("hello world"));
     }
@@ -151,7 +200,7 @@ mod tests {
         let ctx = ToolContext::new(temp_dir.path().to_path_buf());
         let args = json!({ "command": "pwd" });
 
-        let result = tool.execute(args, &ctx).await.unwrap();
+        let result = tool.execute(&args, &ctx).await.unwrap();
         assert!(result.success);
         // On macOS, temp directories are in /private/var, so we need to account for that
         let expected_path = temp_dir.path().canonicalize().unwrap();
@@ -165,7 +214,7 @@ mod tests {
         let ctx = ToolContext::default();
         let args = json!({ "command": "exit 1" });
 
-        let result = tool.execute(args, &ctx).await.unwrap();
+        let result = tool.execute(&args, &ctx).await.unwrap();
         assert!(!result.success);
         assert!(result.error.is_some());
     }
@@ -176,7 +225,7 @@ mod tests {
         let ctx = ToolContext::default();
         let args = json!({ "command": "echo 'error message' >&2" });
 
-        let result = tool.execute(args, &ctx).await.unwrap();
+        let result = tool.execute(&args, &ctx).await.unwrap();
         assert!(result.output.contains("error message"));
     }
 
@@ -189,7 +238,7 @@ mod tests {
             "timeout": 1
         });
 
-        let result = tool.execute(args, &ctx).await.unwrap();
+        let result = tool.execute(&args, &ctx).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("timed out"));
     }
