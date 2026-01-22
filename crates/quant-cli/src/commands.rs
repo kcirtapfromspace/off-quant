@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
+use indicatif::{ProgressBar, ProgressStyle};
 use llm_core::{ChatMessage, Config, OllamaClient, OllamaStatus};
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -456,7 +457,12 @@ pub async fn ask(
     context_path: Option<String>,
     json_output: bool,
     system: Option<String>,
+    temperature: Option<f32>,
+    max_tokens: Option<i32>,
+    no_newline: bool,
 ) -> Result<()> {
+    use llm_core::ChatOptions;
+
     let config = Config::load().context("Failed to load llm.toml")?;
     let client = OllamaClient::new(config.ollama_url());
 
@@ -502,9 +508,20 @@ pub async fn ask(
     }
     messages.push(ChatMessage::user(full_prompt));
 
+    // Build options
+    let options = if temperature.is_some() || max_tokens.is_some() {
+        Some(ChatOptions {
+            temperature,
+            num_predict: max_tokens,
+            ..Default::default()
+        })
+    } else {
+        None
+    };
+
     if json_output {
         // Non-streaming for JSON output
-        let response = client.chat(&model, &messages, None).await?;
+        let response = client.chat(&model, &messages, options).await?;
         let output = serde_json::json!({
             "model": response.model,
             "response": response.message.content,
@@ -514,7 +531,7 @@ pub async fn ask(
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         // Streaming output
-        let mut stream = client.chat_stream(&model, &messages, None).await?;
+        let mut stream = client.chat_stream(&model, &messages, options).await?;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
@@ -523,7 +540,9 @@ pub async fn ask(
                 io::stdout().flush()?;
             }
         }
-        println!();
+        if !no_newline {
+            println!();
+        }
     }
 
     Ok(())
@@ -582,5 +601,96 @@ pub async fn context_clear() -> Result<()> {
     ctx_manager.clear();
     ctx_manager.save()?;
     println!("Context cleared");
+    Ok(())
+}
+
+/// Load/warm up a model
+pub async fn run(model: Option<String>) -> Result<()> {
+    let config = Config::load().context("Failed to load llm.toml")?;
+    let client = OllamaClient::new(config.ollama_url());
+
+    // Check Ollama is running
+    if !client.health_check().await.unwrap_or(false) {
+        anyhow::bail!("Ollama is not running. Start with: quant serve start");
+    }
+
+    // Select model
+    let model = model.unwrap_or_else(|| config.models.coding.clone());
+
+    // Check if already loaded
+    let running = client.list_running().await.unwrap_or_default();
+    if running.iter().any(|m| m.name == model) {
+        println!("Model {} is already loaded", model);
+        return Ok(());
+    }
+
+    // Show loading spinner
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.cyan} {msg}")
+            .unwrap(),
+    );
+    spinner.set_message(format!("Loading {}...", model));
+    spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+
+    // Load the model by sending a minimal request
+    client.load_model(&model).await?;
+
+    spinner.finish_with_message(format!("{}✓{} Model {} loaded", GREEN, RESET, model));
+
+    // Show VRAM usage
+    if let Ok(running) = client.list_running().await {
+        for m in running {
+            if m.name == model {
+                let vram_gb = m.size_vram as f64 / (1024.0 * 1024.0 * 1024.0);
+                println!("  VRAM: {:.1} GB", vram_gb);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Show detailed version and system info
+pub async fn info() -> Result<()> {
+    let config = Config::load().ok();
+
+    println!("{}quant{} - Unified CLI for local LLM management", BOLD, RESET);
+    println!("Version: {}", env!("CARGO_PKG_VERSION"));
+    println!();
+
+    // System info
+    println!("{}System{}", BOLD, RESET);
+    match Config::system_ram_gb() {
+        Ok(ram) => println!("  RAM: {} GB", ram),
+        Err(_) => println!("  RAM: unknown"),
+    }
+    println!("  Arch: {}", std::env::consts::ARCH);
+    println!("  OS: {}", std::env::consts::OS);
+    println!();
+
+    // Config info
+    if let Some(cfg) = config {
+        println!("{}Configuration{}", BOLD, RESET);
+        println!("  Ollama: {}", cfg.ollama_url());
+        println!("  Models path: {}", cfg.ollama.models_path.display());
+        println!("  Default coding model: {}", cfg.models.coding);
+        println!("  Default chat model: {}", cfg.models.chat);
+    } else {
+        println!("{}Configuration{}", BOLD, RESET);
+        println!("  {}llm.toml not found{}", YELLOW, RESET);
+    }
+    println!();
+
+    // Data directories
+    println!("{}Data Directories{}", BOLD, RESET);
+    if let Some(data_dir) = dirs::data_dir() {
+        let quant_dir = data_dir.join("quant");
+        println!("  Data: {}", quant_dir.display());
+        println!("  Conversations: {}", quant_dir.join("conversations").display());
+        println!("  History: {}", quant_dir.join("history").display());
+    }
+
     Ok(())
 }
