@@ -19,7 +19,13 @@ const ID_QUIT: &str = "quit";
 
 // Track last model load error
 use std::sync::Mutex;
+use std::time::Instant;
 static LAST_MODEL_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+// Rate limiting for actions - prevent rapid repeated clicks
+use std::collections::HashMap;
+static ACTION_TIMESTAMPS: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
+const ACTION_DEBOUNCE_SECS: u64 = 2; // Minimum seconds between same action
 
 pub struct TrayManager {
     pub state: AppState,
@@ -238,10 +244,37 @@ impl TrayManager {
         }
     }
 
+    /// Check if an action should be rate-limited. Returns true if action is allowed.
+    fn is_action_allowed(action_id: &str) -> bool {
+        let mut timestamps = ACTION_TIMESTAMPS.lock().unwrap();
+        let map = timestamps.get_or_insert_with(HashMap::new);
+
+        let now = Instant::now();
+        if let Some(last_time) = map.get(action_id) {
+            if now.duration_since(*last_time).as_secs() < ACTION_DEBOUNCE_SECS {
+                tracing::debug!("Action '{}' rate-limited (debounce)", action_id);
+                return false;
+            }
+        }
+        map.insert(action_id.to_string(), now);
+        true
+    }
+
     /// Handle a single menu event, returns true if should quit
     pub fn handle_event(&self, event: &MenuEvent) -> bool {
         let id_str = event.id.0.as_str();
         tracing::info!("=== MENU EVENT ID: '{}' ===", id_str);
+
+        // Rate limit long-running actions to prevent rapid repeated clicks
+        let rate_limited_actions = [ID_START, ID_STOP, ID_RESTART, ID_PULL_MODEL];
+        let is_rate_limited = rate_limited_actions.contains(&id_str)
+            || id_str.starts_with("model:")
+            || id_str.starts_with("repull:")
+            || id_str.starts_with("start_with:");
+
+        if is_rate_limited && !Self::is_action_allowed(id_str) {
+            return false;
+        }
 
         match id_str {
             ID_START => self.handle_start(),
