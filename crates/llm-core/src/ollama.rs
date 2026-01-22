@@ -6,6 +6,50 @@ use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::time::Duration;
 
+/// Configuration for retry behavior
+#[derive(Debug, Clone)]
+pub struct RetryConfig {
+    /// Maximum number of retry attempts
+    pub max_retries: u32,
+    /// Initial delay between retries
+    pub initial_delay: Duration,
+    /// Maximum delay between retries
+    pub max_delay: Duration,
+    /// Multiplier for exponential backoff (e.g., 2.0 doubles delay each retry)
+    pub backoff_multiplier: f64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            initial_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(5),
+            backoff_multiplier: 2.0,
+        }
+    }
+}
+
+impl RetryConfig {
+    /// Create a config with no retries (single attempt)
+    pub fn no_retry() -> Self {
+        Self {
+            max_retries: 0,
+            ..Default::default()
+        }
+    }
+
+    /// Create a config for aggressive retrying (good for health checks)
+    pub fn aggressive() -> Self {
+        Self {
+            max_retries: 5,
+            initial_delay: Duration::from_millis(50),
+            max_delay: Duration::from_secs(2),
+            backoff_multiplier: 1.5,
+        }
+    }
+}
+
 /// Ollama service status
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OllamaStatus {
@@ -175,7 +219,10 @@ pub struct ChatChunkMessage {
 /// Type alias for the stream of chat chunks
 pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>;
 
-#[derive(Debug, Deserialize)]
+/// Type alias for the stream of pull progress
+pub type PullStream = Pin<Box<dyn Stream<Item = Result<PullProgress>> + Send>>;
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct PullProgress {
     pub status: String,
     #[serde(default)]
@@ -219,13 +266,51 @@ impl OllamaClient {
             .await
         {
             Ok(resp) => Ok(resp.status().is_success()),
-            Err(_) => Ok(false),
+            Err(e) => {
+                tracing::debug!("Health check failed: {}", e);
+                Ok(false)
+            }
+        }
+    }
+
+    /// Check if Ollama is running with retry logic
+    pub async fn health_check_with_retry(&self, config: &RetryConfig) -> Result<bool> {
+        let mut attempt = 0;
+        let mut delay = config.initial_delay;
+
+        loop {
+            match self.health_check().await {
+                Ok(true) => return Ok(true),
+                Ok(false) if attempt >= config.max_retries => return Ok(false),
+                Err(e) if attempt >= config.max_retries => return Err(e),
+                _ => {
+                    attempt += 1;
+                    tracing::debug!(
+                        "Health check attempt {} failed, retrying in {:?}",
+                        attempt,
+                        delay
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay = Duration::from_secs_f64(
+                        (delay.as_secs_f64() * config.backoff_multiplier).min(config.max_delay.as_secs_f64()),
+                    );
+                }
+            }
         }
     }
 
     /// Get current status
     pub async fn status(&self) -> OllamaStatus {
         if self.health_check().await.unwrap_or(false) {
+            OllamaStatus::Running
+        } else {
+            OllamaStatus::Stopped
+        }
+    }
+
+    /// Get current status with retry logic
+    pub async fn status_with_retry(&self, config: &RetryConfig) -> OllamaStatus {
+        if self.health_check_with_retry(config).await.unwrap_or(false) {
             OllamaStatus::Running
         } else {
             OllamaStatus::Stopped
@@ -315,6 +400,63 @@ impl OllamaClient {
             .context("Model pull failed")?;
 
         Ok(())
+    }
+
+    /// Pull a model with streaming progress updates
+    pub async fn pull_model_stream(&self, name: &str) -> Result<PullStream> {
+        let url = format!("{}/api/pull", self.base_url);
+
+        let req = PullRequest {
+            name: name.to_string(),
+            stream: true,
+        };
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&req)
+            .send()
+            .await
+            .context("Failed to start model pull")?
+            .error_for_status()
+            .context("Model pull request failed")?;
+
+        let stream = async_stream::try_stream! {
+            use futures::StreamExt as FuturesStreamExt;
+
+            let mut byte_stream = resp.bytes_stream();
+            let mut buffer = String::new();
+
+            while let Some(chunk_result) = FuturesStreamExt::next(&mut byte_stream).await {
+                let chunk: bytes::Bytes = chunk_result.context("Error reading stream")?;
+                let text = String::from_utf8_lossy(&chunk);
+                buffer.push_str(&text);
+
+                // Process complete lines
+                while let Some(newline_pos) = buffer.find('\n') {
+                    let line = buffer[..newline_pos].trim().to_string();
+                    buffer = buffer[newline_pos + 1..].to_string();
+
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    let progress: PullProgress = serde_json::from_str(&line)
+                        .with_context(|| format!("Failed to parse progress: {}", line))?;
+
+                    yield progress;
+                }
+            }
+
+            // Process any remaining content in buffer
+            if !buffer.trim().is_empty() {
+                let progress: PullProgress = serde_json::from_str(buffer.trim())
+                    .with_context(|| format!("Failed to parse final progress: {}", buffer))?;
+                yield progress;
+            }
+        };
+
+        Ok(Box::pin(stream))
     }
 
     /// Delete a model
@@ -538,6 +680,28 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""role":"user""#));
         assert!(json.contains(r#""content":"Hello""#));
+    }
+
+    #[test]
+    fn test_retry_config_default() {
+        let config = RetryConfig::default();
+        assert_eq!(config.max_retries, 3);
+        assert_eq!(config.initial_delay, Duration::from_millis(100));
+        assert_eq!(config.max_delay, Duration::from_secs(5));
+        assert!((config.backoff_multiplier - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_retry_config_no_retry() {
+        let config = RetryConfig::no_retry();
+        assert_eq!(config.max_retries, 0);
+    }
+
+    #[test]
+    fn test_retry_config_aggressive() {
+        let config = RetryConfig::aggressive();
+        assert_eq!(config.max_retries, 5);
+        assert_eq!(config.initial_delay, Duration::from_millis(50));
     }
 
     // Integration tests (require Ollama to be running)
