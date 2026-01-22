@@ -694,3 +694,130 @@ pub async fn info() -> Result<()> {
 
     Ok(())
 }
+
+// Config management commands
+
+/// Create default config file
+pub async fn config_init() -> Result<()> {
+    use crate::config::UserConfig;
+
+    match UserConfig::create_default() {
+        Ok(path) => {
+            println!("{}Created:{} {}", GREEN, RESET, path.display());
+            println!("\nEdit this file to customize your quant experience.");
+        }
+        Err(e) => {
+            if e.to_string().contains("already exists") {
+                let path = UserConfig::config_path()?;
+                println!("Config file already exists: {}", path.display());
+                println!("Use 'quant config edit' to modify it.");
+            } else {
+                return Err(e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Show current configuration
+pub async fn config_show() -> Result<()> {
+    use crate::config::UserConfig;
+
+    let path = UserConfig::config_path()?;
+
+    if !path.exists() {
+        println!("No config file found at: {}", path.display());
+        println!("Run 'quant config init' to create one.");
+        return Ok(());
+    }
+
+    let config = UserConfig::load()?;
+
+    println!("{}User Configuration{}", BOLD, RESET);
+    println!("  Path: {}", path.display());
+    println!();
+
+    println!("{}[repl]{}", BLUE, RESET);
+    if let Some(ref model) = config.repl.default_model {
+        println!("  default_model = \"{}\"", model);
+    }
+    if let Some(ref sys) = config.repl.system_prompt {
+        println!("  system_prompt = \"{}\"", sys);
+    }
+    println!("  auto_save = {}", config.repl.auto_save);
+    println!("  history_size = {}", config.repl.history_size);
+    println!("  theme = \"{}\"", config.repl.theme);
+    println!();
+
+    println!("{}[ask]{}", BLUE, RESET);
+    if let Some(ref model) = config.ask.default_model {
+        println!("  default_model = \"{}\"", model);
+    }
+    if let Some(temp) = config.ask.temperature {
+        println!("  temperature = {}", temp);
+    }
+    if let Some(max) = config.ask.max_tokens {
+        println!("  max_tokens = {}", max);
+    }
+    println!();
+
+    if !config.aliases.models.is_empty() {
+        println!("{}[aliases.models]{}", BLUE, RESET);
+        for (alias, model) in &config.aliases.models {
+            println!("  {} = \"{}\"", alias, model);
+        }
+    }
+
+    Ok(())
+}
+
+/// Print config file path
+pub async fn config_path() -> Result<()> {
+    use crate::config::UserConfig;
+
+    let path = UserConfig::config_path()?;
+    println!("{}", path.display());
+
+    Ok(())
+}
+
+/// Edit config file
+pub async fn config_edit() -> Result<()> {
+    use crate::config::UserConfig;
+
+    let path = UserConfig::config_path()?;
+
+    // Create default if doesn't exist
+    if !path.exists() {
+        UserConfig::create_default()?;
+        println!("Created default config at: {}", path.display());
+    }
+
+    // Get editor from environment
+    let editor = std::env::var("EDITOR")
+        .or_else(|_| std::env::var("VISUAL"))
+        .unwrap_or_else(|_| {
+            if cfg!(target_os = "macos") {
+                "open -e".to_string()
+            } else {
+                "nano".to_string()
+            }
+        });
+
+    // Open editor
+    let parts: Vec<&str> = editor.split_whitespace().collect();
+    let (cmd, args) = parts.split_first().context("Invalid editor command")?;
+
+    let mut command = Command::new(cmd);
+    command.args(args.iter());
+    command.arg(&path);
+
+    let status = command.status().context("Failed to open editor")?;
+
+    if !status.success() {
+        anyhow::bail!("Editor exited with error");
+    }
+
+    Ok(())
+}
