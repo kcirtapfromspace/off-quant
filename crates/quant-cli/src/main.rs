@@ -8,6 +8,7 @@ mod config;
 mod context;
 mod conversation;
 mod hooks;
+mod mcp;
 mod progress;
 mod project;
 mod repl;

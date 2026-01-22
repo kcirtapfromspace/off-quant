@@ -5,7 +5,9 @@
 //! 2. Auto-detecting project type (Rust, Node, Python, etc.)
 //! 3. Building a project structure summary
 //! 4. Providing relevant context to the LLM
+//! 5. Parsing MCP server configurations from QUANT.md frontmatter
 
+use crate::mcp::McpServerConfig;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 
@@ -62,14 +64,29 @@ impl std::fmt::Display for ProjectType {
 /// Parsed QUANT.md content
 #[derive(Debug, Clone, Default)]
 pub struct QuantFile {
-    /// Raw content
+    /// Raw content (without frontmatter)
     pub content: String,
+    /// Raw frontmatter YAML content
+    pub frontmatter: Option<String>,
     /// Project description (first paragraph or # header)
     pub description: Option<String>,
     /// Key instructions extracted
     pub instructions: Vec<String>,
+    /// MCP server configurations from frontmatter
+    pub mcp_servers: Vec<McpServerConfig>,
+    /// Context configuration from frontmatter
+    pub context_config: Option<ContextConfig>,
     /// File path
     pub path: PathBuf,
+}
+
+/// Context configuration from QUANT.md frontmatter
+#[derive(Debug, Clone, Default)]
+pub struct ContextConfig {
+    /// Maximum tokens for context
+    pub max_tokens: Option<usize>,
+    /// Whether to include dependencies in context
+    pub include_dependencies: Option<bool>,
 }
 
 impl QuantFile {
@@ -77,16 +94,58 @@ impl QuantFile {
     pub fn parse(path: PathBuf, content: String) -> Self {
         let mut description = None;
         let mut instructions = Vec::new();
+        let mut mcp_servers = Vec::new();
+        let mut context_config = None;
+        let mut frontmatter = None;
         let mut in_instructions = false;
 
-        for line in content.lines() {
+        // Check for YAML frontmatter (---\n...\n---)
+        let body_content = if content.starts_with("---") {
+            if let Some(end_idx) = content[3..].find("\n---") {
+                let yaml_content = &content[3..3 + end_idx].trim();
+                frontmatter = Some(yaml_content.to_string());
+
+                // Parse MCP servers from frontmatter
+                if let Ok(parsed) = serde_yaml::from_str::<serde_yaml::Value>(yaml_content) {
+                    // Extract mcp_servers
+                    if let Some(servers) = parsed.get("mcp_servers") {
+                        if let Ok(configs) = serde_yaml::from_value::<Vec<McpServerConfig>>(servers.clone()) {
+                            mcp_servers = configs;
+                        }
+                    }
+
+                    // Extract context config
+                    if let Some(ctx) = parsed.get("context") {
+                        let mut cfg = ContextConfig::default();
+                        if let Some(max) = ctx.get("max_tokens").and_then(|v| v.as_u64()) {
+                            cfg.max_tokens = Some(max as usize);
+                        }
+                        if let Some(deps) = ctx.get("include_dependencies").and_then(|v| v.as_bool()) {
+                            cfg.include_dependencies = Some(deps);
+                        }
+                        if cfg.max_tokens.is_some() || cfg.include_dependencies.is_some() {
+                            context_config = Some(cfg);
+                        }
+                    }
+                }
+
+                // Return content after frontmatter
+                content[3 + end_idx + 4..].to_string()
+            } else {
+                content.clone()
+            }
+        } else {
+            content.clone()
+        };
+
+        for line in body_content.lines() {
             let trimmed = line.trim();
 
             // Extract description from first heading or paragraph
             if description.is_none() && !trimmed.is_empty() {
                 if trimmed.starts_with("# ") {
                     description = Some(trimmed[2..].to_string());
-                } else if !trimmed.starts_with('#') {
+                } else if !trimmed.starts_with('#') && !trimmed.starts_with("---") {
                     description = Some(trimmed.to_string());
                 }
             }
@@ -109,11 +168,19 @@ impl QuantFile {
         }
 
         Self {
-            content,
+            content: body_content,
+            frontmatter,
             description,
             instructions,
+            mcp_servers,
+            context_config,
             path,
         }
+    }
+
+    /// Check if this QUANT.md has MCP server configurations
+    pub fn has_mcp_servers(&self) -> bool {
+        !self.mcp_servers.is_empty()
     }
 }
 

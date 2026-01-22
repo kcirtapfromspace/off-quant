@@ -127,6 +127,11 @@ impl ToolRouter {
         &self.registry
     }
 
+    /// Get a mutable reference to the registry
+    pub fn registry_mut(&mut self) -> &mut ToolRegistry {
+        &mut self.registry
+    }
+
     /// Execute a tool call directly, returning an error for failures
     pub async fn execute(&self, tool_call: &ToolCall, ctx: &ToolContext) -> Result<ToolResult> {
         match self.route(tool_call, ctx).await {
