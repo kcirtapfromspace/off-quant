@@ -7,11 +7,15 @@ use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use llm_core::{ChatMessage, Config, OllamaClient, OllamaStatus};
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use crate::agent::{AgentConfig, AgentLoop};
 use crate::context::ContextManager;
+use crate::tools::builtin::create_default_registry;
+use crate::tools::router::ToolRouter;
+use crate::tools::security::TerminalConfirmation;
 
 // ANSI color codes
 const GREEN: &str = "\x1b[92m";
@@ -106,22 +110,31 @@ pub async fn health(timeout_secs: u64) -> Result<()> {
     let config = Config::load().context("Failed to load llm.toml")?;
     let client = OllamaClient::new(config.ollama_url());
 
-    print!("Waiting for Ollama (timeout: {}s)...", timeout_secs);
-    io::stdout().flush()?;
+    let pb = ProgressBar::new(timeout_secs);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.cyan} Waiting for Ollama [{bar:30.cyan/dim}] {pos}/{len}s")
+            .unwrap()
+            .progress_chars("=>-"),
+    );
 
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(timeout_secs);
-    let interval = Duration::from_secs(2);
+    let interval = Duration::from_secs(1);
 
     while start.elapsed() < timeout {
+        pb.set_position(start.elapsed().as_secs());
+
         if client.health_check().await.unwrap_or(false) {
-            println!(" {}OK{}", GREEN, RESET);
+            pb.finish_and_clear();
+            println!("{}✓{} Ollama is ready", GREEN, RESET);
             return Ok(());
         }
         tokio::time::sleep(interval).await;
     }
 
-    println!(" {}FAILED{}", RED, RESET);
+    pb.finish_and_clear();
+    println!("{}✗{} Ollama did not become ready within {}s", RED, RESET, timeout_secs);
     anyhow::bail!("Ollama did not become ready within timeout")
 }
 
@@ -175,21 +188,53 @@ pub async fn models_list() -> Result<()> {
 
 /// Pull a model from Ollama registry
 pub async fn models_pull(name: &str) -> Result<()> {
+    let config = Config::load().context("Failed to load llm.toml")?;
+    let client = OllamaClient::new(config.ollama_url());
+
+    // Check Ollama is running
+    if !client.health_check().await.unwrap_or(false) {
+        anyhow::bail!("Ollama is not running. Start with: quant serve start");
+    }
+
     println!("Pulling {}...", name);
 
-    // Use ollama CLI for progress display
-    let status = Command::new("ollama")
-        .arg("pull")
-        .arg(name)
-        .status()
-        .context("Failed to run ollama pull")?;
+    // Use streaming pull API for progress
+    let mut stream = client
+        .pull_model_stream(name)
+        .await
+        .context("Failed to start model pull")?;
 
-    if status.success() {
-        println!("{}Done!{}", GREEN, RESET);
-        Ok(())
-    } else {
-        anyhow::bail!("Failed to pull model")
+    let pb = ProgressBar::new(100);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.cyan} {msg} [{bar:30.cyan/dim}] {percent}%")
+            .unwrap()
+            .progress_chars("=>-"),
+    );
+    pb.set_message(name.to_string());
+
+    let mut last_status = String::new();
+
+    while let Some(progress) = stream.next().await {
+        let progress = progress?;
+
+        // Update status message if changed
+        if progress.status != last_status {
+            last_status = progress.status.clone();
+            pb.set_message(format!("{}: {}", name, progress.status));
+        }
+
+        // Update progress bar if we have total/completed info
+        if progress.total > 0 {
+            let percent = (progress.completed as f64 / progress.total as f64 * 100.0) as u64;
+            pb.set_position(percent);
+        }
     }
+
+    pb.finish_and_clear();
+    println!("{}✓{} Pulled {}", GREEN, RESET, name);
+
+    Ok(())
 }
 
 /// Remove a model
@@ -520,8 +565,14 @@ pub async fn ask(
     };
 
     if json_output {
-        // Non-streaming for JSON output
-        let response = client.chat(&model, &messages, options).await?;
+        // Non-streaming for JSON output (with timeout)
+        let response = tokio::time::timeout(
+            Duration::from_secs(300),
+            client.chat(&model, &messages, options),
+        )
+        .await
+        .context("Request timed out after 5 minutes")??;
+
         let output = serde_json::json!({
             "model": response.model,
             "response": response.message.content,
@@ -530,10 +581,18 @@ pub async fn ask(
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        // Streaming output
-        let mut stream = client.chat_stream(&model, &messages, options).await?;
+        // Streaming output (with timeout on initial connection)
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(60),
+            client.chat_stream(&model, &messages, options),
+        )
+        .await
+        .context("Connection timed out after 60 seconds")??;
 
-        while let Some(chunk) = stream.next().await {
+        let stream_timeout = Duration::from_secs(120); // 2 min between chunks
+        while let Ok(Some(chunk)) =
+            tokio::time::timeout(stream_timeout, stream.next()).await
+        {
             let chunk = chunk?;
             if let Some(msg) = &chunk.message {
                 print!("{}", msg.content);
@@ -575,8 +634,25 @@ pub async fn context_list() -> Result<()> {
     }
 
     println!("{}Context Files{}", BOLD, RESET);
-    for file in files {
+    for file in &files {
         println!("  {}", file);
+    }
+
+    // Show token usage
+    if let Ok((tokens, max_tokens, is_truncated)) = ctx_manager.token_status() {
+        println!();
+        let usage_pct = (tokens as f64 / max_tokens as f64 * 100.0) as u32;
+        let status = if is_truncated {
+            format!("{}(truncated){}", RED, RESET)
+        } else if usage_pct > 80 {
+            format!("{}(approaching limit){}", YELLOW, RESET)
+        } else {
+            String::new()
+        };
+        println!(
+            "{}Tokens:{} ~{} / {} ({}%) {}",
+            BOLD, RESET, tokens, max_tokens, usage_pct, status
+        );
     }
 
     Ok(())
@@ -817,6 +893,99 @@ pub async fn config_edit() -> Result<()> {
 
     if !status.success() {
         anyhow::bail!("Editor exited with error");
+    }
+
+    Ok(())
+}
+
+/// Run agent with autonomous task execution
+pub async fn agent(
+    task: &str,
+    model: Option<String>,
+    system: Option<String>,
+    auto: bool,
+    max_iterations: usize,
+    quiet: bool,
+) -> Result<()> {
+    // Load config, fall back to defaults
+    let (config, _) = match Config::try_load() {
+        Some(cfg) => (cfg, None),
+        None => (Config::default_minimal(), Some("Using default config")),
+    };
+
+    let client = OllamaClient::new(config.ollama_url());
+
+    // Check Ollama is running
+    if !client.health_check().await.unwrap_or(false) {
+        anyhow::bail!(
+            "Ollama is not running.\nStart with: {}quant serve start{}",
+            BLUE,
+            RESET
+        );
+    }
+
+    // Determine model
+    let model = model.unwrap_or_else(|| {
+        if !config.models.coding.is_empty() {
+            config.models.coding.clone()
+        } else {
+            "llama3.2".to_string()
+        }
+    });
+
+    // Create tool registry and router
+    let registry = create_default_registry();
+    let confirmation = if auto {
+        TerminalConfirmation::auto()
+    } else {
+        TerminalConfirmation::new()
+    };
+    let router = ToolRouter::new(registry, confirmation);
+
+    // Configure the agent
+    let agent_config = AgentConfig::new(&model)
+        .with_max_iterations(max_iterations)
+        .with_working_dir(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .with_auto_mode(auto)
+        .with_verbose(!quiet);
+
+    let agent_config = if let Some(sys) = system {
+        agent_config.with_system_prompt(sys)
+    } else {
+        agent_config
+    };
+
+    // Create and run the agent
+    let agent = AgentLoop::new(client, router, agent_config);
+
+    if !quiet {
+        println!("{}Agent Mode{}", BOLD, RESET);
+        println!("  Model: {}", model);
+        println!("  Task: {}", task);
+        println!("  Auto mode: {}", if auto { "yes" } else { "no" });
+        println!();
+    }
+
+    let state = agent.run(task).await?;
+
+    // Print results
+    if let Some(response) = state.final_response {
+        println!();
+        println!("{}Final Response:{}", BOLD, RESET);
+        println!("{}", response);
+    }
+
+    if let Some(error) = state.error {
+        println!();
+        println!("{}Error:{} {}", RED, RESET, error);
+    }
+
+    if !quiet {
+        println!();
+        println!(
+            "{}Completed in {} iterations{}",
+            GREEN, state.iteration, RESET
+        );
     }
 
     Ok(())

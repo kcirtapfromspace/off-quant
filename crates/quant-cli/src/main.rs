@@ -2,11 +2,13 @@
 //!
 //! Provides a Claude Code-like experience for local LLMs via Ollama.
 
+mod agent;
 mod commands;
 mod config;
 mod context;
 mod conversation;
 mod repl;
+mod tools;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -146,6 +148,32 @@ enum Commands {
         /// Shell to generate completions for
         #[arg(value_enum)]
         shell: clap_complete::Shell,
+    },
+
+    /// Run agent with tools for autonomous task execution
+    Agent {
+        /// The task to perform
+        task: Vec<String>,
+
+        /// Model to use
+        #[arg(short, long)]
+        model: Option<String>,
+
+        /// System prompt
+        #[arg(short, long)]
+        system: Option<String>,
+
+        /// Auto-approve all tool executions (skip confirmations)
+        #[arg(long)]
+        auto: bool,
+
+        /// Maximum iterations before stopping
+        #[arg(long, default_value = "50")]
+        max_iterations: usize,
+
+        /// Quiet mode (less verbose output)
+        #[arg(short, long)]
+        quiet: bool,
     },
 }
 
@@ -289,6 +317,17 @@ async fn main() -> Result<()> {
             let name = cmd.get_name().to_string();
             generate(shell, &mut cmd, name, &mut std::io::stdout());
             Ok(())
+        }
+        Some(Commands::Agent {
+            task,
+            model,
+            system,
+            auto,
+            max_iterations,
+            quiet,
+        }) => {
+            let task_text = task.join(" ");
+            commands::agent(&task_text, model, system, auto, max_iterations, quiet).await
         }
         None => {
             // Default to chat REPL when no command specified

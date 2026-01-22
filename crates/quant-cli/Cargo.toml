@@ -36,3 +36,17 @@ dirs = "5"
 chrono = { version = "0.4", features = ["serde"] }
 glob = "0.3"
 toml.workspace = true
+
+# Tool framework
+async-trait = "0.1"
+scraper = "0.19"
+ego-tree = "0.6"
+url = "2"
+which = "6"
+regex = "1"
+walkdir = "2"
+urlencoding = "2"
+reqwest = { version = "0.12", features = ["json"] }
+
+[dev-dependencies]
+tempfile = "3"

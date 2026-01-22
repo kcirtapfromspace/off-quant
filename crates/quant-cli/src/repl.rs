@@ -5,8 +5,9 @@
 //! - Streaming responses
 //! - Slash commands for in-session control
 //! - Conversation save/load
+//! - Agent mode with tool execution
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 // crossterm is available for future terminal features
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -15,9 +16,15 @@ use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
 use rustyline::{DefaultEditor, Editor};
 use std::io::{stdout, Write};
+use std::path::PathBuf;
 
+use crate::agent::{AgentConfig, AgentLoop};
+use crate::config::UserConfig;
 use crate::context::ContextManager;
 use crate::conversation::{Conversation, ConversationStore, InputHistory};
+use crate::tools::builtin::create_default_registry;
+use crate::tools::router::ToolRouter;
+use crate::tools::security::TerminalConfirmation;
 
 // ANSI colors
 const GREEN: &str = "\x1b[92m";
@@ -45,11 +52,25 @@ struct ReplState {
     store: ConversationStore,
     /// Whether to auto-save
     auto_save: bool,
+    /// Whether agent mode is enabled
+    agent_mode: bool,
 }
 
 impl ReplState {
     async fn new(model: Option<String>, system: Option<String>) -> Result<Self> {
-        let config = Config::load().context("Failed to load llm.toml")?;
+        // Try to load config, fall back to defaults if missing
+        let (config, config_warning) = match Config::try_load() {
+            Some(cfg) => (cfg, None),
+            None => {
+                let warning = format!(
+                    "{}Warning:{} llm.toml not found, using defaults (localhost:11434)",
+                    YELLOW, RESET
+                );
+                (Config::default_minimal(), Some(warning))
+            }
+        };
+
+        let user_config = UserConfig::load().unwrap_or_default();
         let client = OllamaClient::new(config.ollama_url());
 
         // Check Ollama is running
@@ -61,7 +82,41 @@ impl ReplState {
             );
         }
 
-        let model = model.unwrap_or_else(|| config.models.chat.clone());
+        // Print config warning if applicable
+        if let Some(warning) = config_warning {
+            eprintln!("{}", warning);
+        }
+
+        // Determine model: CLI arg > user config > llm.toml > first available
+        let model = if let Some(m) = model {
+            m
+        } else if let Some(m) = user_config.repl.default_model.clone() {
+            m
+        } else if !config.models.chat.is_empty() {
+            config.models.chat.clone()
+        } else {
+            // No config available, try to get first available model from Ollama
+            match client.list_models().await {
+                Ok(models) if !models.is_empty() => {
+                    let first_model = models[0].name.clone();
+                    eprintln!(
+                        "{}Info:{} No default model configured, using: {}",
+                        DIM, RESET, first_model
+                    );
+                    first_model
+                }
+                _ => {
+                    anyhow::bail!(
+                        "No models available. Pull a model with: {}quant models pull <name>{}",
+                        BLUE, RESET
+                    );
+                }
+            }
+        };
+
+        // Use system prompt from: CLI arg > user config
+        let system = system.or_else(|| user_config.repl.system_prompt.clone());
+
         let conversation = Conversation::new(model.clone(), system);
         let context = ContextManager::new()?;
         let store = ConversationStore::new()?;
@@ -73,7 +128,8 @@ impl ReplState {
             conversation,
             context,
             store,
-            auto_save: false,
+            auto_save: user_config.repl.auto_save,
+            agent_mode: false,
         })
     }
 
@@ -298,6 +354,7 @@ async fn handle_slash_command(state: &mut ReplState, input: &str) -> Result<bool
                         llm_core::Role::User => CYAN,
                         llm_core::Role::Assistant => GREEN,
                         llm_core::Role::System => YELLOW,
+                        llm_core::Role::Tool => BLUE,
                     };
                     let preview = if msg.content.len() > 60 {
                         format!("{}...", &msg.content[..60])
@@ -330,6 +387,22 @@ async fn handle_slash_command(state: &mut ReplState, input: &str) -> Result<bool
             );
             Ok(false)
         }
+        "/agent" => {
+            state.agent_mode = !state.agent_mode;
+            if state.agent_mode {
+                println!(
+                    "{}Agent mode: enabled{} (tools active)",
+                    GREEN, RESET
+                );
+                println!("Messages will be processed with tool calling.");
+            } else {
+                println!(
+                    "{}Agent mode: disabled{}",
+                    YELLOW, RESET
+                );
+            }
+            Ok(false)
+        }
         _ => {
             println!("{}Unknown command:{} {}", YELLOW, RESET, cmd);
             println!("Type {}/help{} for available commands", CYAN, RESET);
@@ -355,12 +428,14 @@ fn print_help() {
     println!("  {}/history{}          Show conversation history", CYAN, RESET);
     println!("  {}/status{}           Show Ollama status", CYAN, RESET);
     println!("  {}/autosave{}         Toggle auto-save on exit", CYAN, RESET);
+    println!("  {}/agent{}            Toggle agent mode (tool execution)", CYAN, RESET);
     println!("  {}/exit{}, /quit, /q  Exit the REPL", CYAN, RESET);
     println!();
     println!("{}Tips:{}", DIM, RESET);
     println!("  - Press Ctrl+C to cancel current input");
     println!("  - Press Ctrl+D to exit");
     println!("  - Use arrow keys to navigate history");
+    println!("  - Use /agent to enable tool calling");
     println!();
 }
 
@@ -387,9 +462,41 @@ async fn handle_model_command(state: &mut ReplState, args: &str) -> Result<()> {
         return Ok(());
     }
 
+    // Check if model is already loaded
+    let running = state.client.list_running().await.unwrap_or_default();
+    let already_loaded = running.iter().any(|m| m.name == args);
+
     state.model = args.to_string();
     state.conversation.model = args.to_string();
-    println!("Switched to model: {}{}{}", BLUE, args, RESET);
+
+    if already_loaded {
+        println!("Switched to model: {}{}{}", BLUE, args, RESET);
+    } else {
+        // Warm up the model to avoid latency on first message
+        let spinner = ProgressBar::new_spinner();
+        spinner.set_style(
+            ProgressStyle::default_spinner()
+                .template("{spinner:.cyan} {msg}")
+                .unwrap(),
+        );
+        spinner.set_message(format!("Loading {}...", args));
+        spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+
+        match state.client.load_model(args).await {
+            Ok(()) => {
+                spinner.finish_and_clear();
+                println!("{}✓{} Switched to model: {}{}{}", GREEN, RESET, BLUE, args, RESET);
+            }
+            Err(e) => {
+                spinner.finish_and_clear();
+                println!(
+                    "{}Warning:{} Model set but failed to pre-load: {}",
+                    YELLOW, RESET, e
+                );
+                println!("First message may be slow while model loads.");
+            }
+        }
+    }
 
     Ok(())
 }
@@ -458,6 +565,11 @@ fn handle_context_command(state: &mut ReplState, args: &str) -> Result<()> {
 
 /// Send a message and stream the response
 async fn send_message(state: &mut ReplState, input: &str) -> Result<()> {
+    // Check if agent mode is enabled
+    if state.agent_mode {
+        return send_message_agent(state, input).await;
+    }
+
     // Build the user message with context
     let mut full_message = String::new();
 
@@ -488,6 +600,9 @@ async fn send_message(state: &mut ReplState, input: &str) -> Result<()> {
     spinner.set_message("Thinking...");
     spinner.enable_steady_tick(std::time::Duration::from_millis(100));
 
+    // Start timing
+    let start_time = std::time::Instant::now();
+
     // Start streaming
     let mut stream = state
         .client
@@ -500,24 +615,140 @@ async fn send_message(state: &mut ReplState, input: &str) -> Result<()> {
     stdout().flush()?;
 
     let mut response_content = String::new();
+    let mut first_token_time: Option<std::time::Duration> = None;
+    let mut token_count = 0u32;
+    let mut eval_duration: Option<u64> = None;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         if let Some(msg) = &chunk.message {
+            // Track time to first token
+            if first_token_time.is_none() && !msg.content.is_empty() {
+                first_token_time = Some(start_time.elapsed());
+            }
             print!("{}", msg.content);
             stdout().flush()?;
             response_content.push_str(&msg.content);
         }
+        // Capture final stats from the done message
+        if chunk.done {
+            if let Some(count) = chunk.eval_count {
+                token_count = count;
+            }
+            if let Some(duration) = chunk.eval_duration {
+                eval_duration = Some(duration);
+            }
+        }
     }
+
+    let total_time = start_time.elapsed();
 
     print!("{}", RESET);
     println!();
-    println!();
+
+    // Show timing metrics (subtle, dimmed)
+    let ttft = first_token_time
+        .map(|d| format!("{:.1}s", d.as_secs_f64()))
+        .unwrap_or_else(|| "?".to_string());
+    let tokens_per_sec = if let Some(eval_ns) = eval_duration {
+        if eval_ns > 0 && token_count > 0 {
+            let tps = token_count as f64 / (eval_ns as f64 / 1_000_000_000.0);
+            format!("{:.1} tok/s", tps)
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    tracing::debug!(
+        model = %state.model,
+        tokens = token_count,
+        ttft_ms = first_token_time.map(|d| d.as_millis() as u64).unwrap_or(0),
+        total_ms = total_time.as_millis() as u64,
+        "chat_complete"
+    );
+
+    // Only show metrics if we have meaningful data
+    if token_count > 0 {
+        println!(
+            "{}[{} tokens | TTFT: {} | {}]{}\n",
+            DIM, token_count, ttft, tokens_per_sec, RESET
+        );
+    } else {
+        println!();
+    }
 
     // Add assistant response to conversation
     state
         .conversation
         .add_message(ChatMessage::assistant(response_content));
+
+    Ok(())
+}
+
+/// Send a message in agent mode with tool execution
+async fn send_message_agent(state: &mut ReplState, input: &str) -> Result<()> {
+    // Build the user message with context
+    let mut full_message = String::new();
+
+    // Add context if available
+    let context_content = state.context.build_context()?;
+    if !context_content.is_empty() {
+        full_message.push_str(&context_content);
+        full_message.push_str("\n---\n\n");
+    }
+
+    full_message.push_str(input);
+
+    // Create tool registry and router
+    let registry = create_default_registry();
+    let confirmation = TerminalConfirmation::new();
+    let router = ToolRouter::new(registry, confirmation);
+
+    // Configure the agent
+    let agent_config = AgentConfig::new(&state.model)
+        .with_max_iterations(50)
+        .with_working_dir(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        .with_auto_mode(false)
+        .with_verbose(true);
+
+    // Add system prompt if set
+    let agent_config = if let Some(ref sys) = state.conversation.system_prompt {
+        agent_config.with_system_prompt(sys.clone())
+    } else {
+        agent_config
+    };
+
+    // Create and run the agent
+    let agent = AgentLoop::new(state.client.clone(), router, agent_config);
+    let agent_state = agent.run(&full_message).await?;
+
+    // Add user message to conversation history
+    state
+        .conversation
+        .add_message(ChatMessage::user(full_message));
+
+    // Add final response to conversation history
+    if let Some(ref response) = agent_state.final_response {
+        println!();
+        println!("{}Response:{}", GREEN, RESET);
+        println!("{}", response);
+        state
+            .conversation
+            .add_message(ChatMessage::assistant(response.clone()));
+    }
+
+    if let Some(ref error) = agent_state.error {
+        println!();
+        println!("{}Error:{} {}", YELLOW, RESET, error);
+    }
+
+    println!();
+    println!(
+        "{}[Agent completed in {} iterations]{}",
+        DIM, agent_state.iteration, RESET
+    );
 
     Ok(())
 }
