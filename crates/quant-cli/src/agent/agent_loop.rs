@@ -9,6 +9,9 @@ use llm_core::{
 };
 use tracing::{debug, info, instrument, warn};
 
+use crate::context::{SmartContext, SmartContextSelector};
+use crate::progress::Spinner;
+use crate::project::ProjectContext;
 use crate::tools::router::{RouteResult, ToolRouter};
 use crate::tools::{ToolCall, ToolContext};
 
@@ -27,15 +30,28 @@ pub struct AgentLoop {
     client: OllamaClient,
     router: ToolRouter,
     config: AgentConfig,
+    project_context: Option<ProjectContext>,
 }
 
 impl AgentLoop {
     /// Create a new agent loop
     pub fn new(client: OllamaClient, router: ToolRouter, config: AgentConfig) -> Self {
+        // Auto-discover project context from working directory
+        let project_context = ProjectContext::discover(&config.working_dir);
+        if let Some(ref ctx) = project_context {
+            info!(
+                project = %ctx.name,
+                project_type = %ctx.project_type,
+                has_quant_md = ctx.quant_file.is_some(),
+                "Discovered project context"
+            );
+        }
+
         Self {
             client,
             router,
             config,
+            project_context,
         }
     }
 
@@ -44,6 +60,9 @@ impl AgentLoop {
     pub async fn run(&self, task: &str) -> Result<AgentState> {
         info!(task_len = task.len(), max_iterations = self.config.max_iterations, "Starting agent loop");
         let mut state = AgentState::new();
+
+        // Select smart context based on the task
+        let smart_context = self.select_smart_context(task);
 
         // Add system prompt if configured
         if let Some(ref system) = self.config.system_prompt {
@@ -54,8 +73,8 @@ impl AgentLoop {
                 tool_call_id: None,
             });
         } else {
-            // Default agent system prompt
-            let default_system = self.default_system_prompt();
+            // Default agent system prompt with smart context
+            let default_system = self.default_system_prompt_with_context(&smart_context);
             state.add_message(ChatMessageWithTools {
                 role: Role::System,
                 content: default_system,
@@ -94,7 +113,17 @@ impl AgentLoop {
 
             // Call the LLM with tools
             debug!("Calling LLM with tools");
-            let response = match self
+
+            // Show spinner during LLM thinking
+            let mut spinner = if self.config.verbose {
+                let mut s = Spinner::new("Thinking...");
+                s.start();
+                Some(s)
+            } else {
+                None
+            };
+
+            let response = self
                 .client
                 .chat_with_tools(
                     &self.config.model,
@@ -102,8 +131,14 @@ impl AgentLoop {
                     Some(&tool_defs),
                     Some(ChatOptions::default()),
                 )
-                .await
-            {
+                .await;
+
+            // Stop spinner
+            if let Some(ref mut s) = spinner {
+                s.stop().await;
+            }
+
+            let response = match response {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(error = %e, "LLM request failed");
@@ -168,16 +203,30 @@ impl AgentLoop {
                     }
                 }
 
-                if self.config.verbose {
+                // Show tool execution with spinner
+                let mut tool_spinner = if self.config.verbose {
                     println!();
+                    let mut s = Spinner::new(format!("Running {}...", call.name));
+                    s.start();
+                    Some(s)
+                } else {
+                    None
+                };
+
+                let result = self.router.route(&call, &tool_ctx).await;
+
+                // Stop tool spinner
+                if let Some(ref mut s) = tool_spinner {
+                    s.stop().await;
+                }
+
+                if self.config.verbose {
                     print!(
                         "{}[Tool: {}]{} ",
                         CYAN, call.name, RESET
                     );
                     stdout().flush()?;
                 }
-
-                let result = self.router.route(&call, &tool_ctx).await;
 
                 let (tool_result, is_success, should_abort) = match result {
                     RouteResult::Success(r) => {
@@ -281,26 +330,79 @@ impl AgentLoop {
         Ok(state)
     }
 
-    fn default_system_prompt(&self) -> String {
-        format!(
-            r#"You are an AI assistant with access to tools for completing tasks. You can read files, search for content, execute commands, and more.
+    /// Select relevant files based on the task using smart context
+    fn select_smart_context(&self, task: &str) -> Option<SmartContext> {
+        let project_root = self.project_context.as_ref().map(|c| c.root.clone())
+            .unwrap_or_else(|| self.config.working_dir.clone());
 
-Working directory: {}
+        let mut selector = SmartContextSelector::new(project_root)
+            .with_max_tokens(4000); // Reserve tokens for smart context
 
-Available tools:
-{}
+        match selector.select_context(task) {
+            Ok(ctx) if !ctx.is_empty() => {
+                if self.config.verbose {
+                    println!(
+                        "{}[Smart Context]{} Auto-selected {} relevant file(s)",
+                        CYAN, RESET, ctx.files.len()
+                    );
+                }
+                info!(
+                    files = ctx.files.len(),
+                    chars = ctx.char_count(),
+                    "Smart context selected files"
+                );
+                Some(ctx)
+            }
+            Ok(_) => {
+                debug!("No relevant files found for smart context");
+                None
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to select smart context");
+                None
+            }
+        }
+    }
 
-Guidelines:
+    /// Build system prompt with optional smart context
+    fn default_system_prompt_with_context(&self, smart_context: &Option<SmartContext>) -> String {
+        let mut prompt = String::new();
+
+        prompt.push_str("You are an AI assistant with access to tools for completing tasks. You can read files, search for content, execute commands, and more.\n\n");
+
+        // Add project context if available
+        if let Some(ref ctx) = self.project_context {
+            prompt.push_str(&ctx.to_system_context());
+            prompt.push_str("\n");
+        } else {
+            prompt.push_str(&format!("Working directory: {}\n\n", self.config.working_dir.display()));
+        }
+
+        // Add smart context (auto-selected relevant files)
+        if let Some(ref ctx) = smart_context {
+            prompt.push_str(&ctx.to_context_string());
+        }
+
+        prompt.push_str("## Available Tools\n");
+        prompt.push_str(&self.format_tool_list());
+        prompt.push_str("\n\n");
+
+        prompt.push_str(r#"## Guidelines
 - Use tools to gather information before responding
 - For file operations, prefer reading before writing
 - For commands, explain what you're doing
 - Be concise but thorough
 - If a task is unclear, ask for clarification
+- Follow any project-specific instructions from QUANT.md
+- Relevant files have been pre-loaded above - use them as context
 
-When you have completed the task, provide a final summary response without calling any more tools."#,
-            self.config.working_dir.display(),
-            self.format_tool_list()
-        )
+When you have completed the task, provide a final summary response without calling any more tools."#);
+
+        prompt
+    }
+
+    fn default_system_prompt(&self) -> String {
+        self.default_system_prompt_with_context(&None)
     }
 
     fn format_tool_list(&self) -> String {
