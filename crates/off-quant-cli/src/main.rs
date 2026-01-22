@@ -115,10 +115,7 @@ fn run_exo(args: &Args, prompt: &str) -> Result<()> {
         .clone()
         .context("MODEL_PATH or --model is required for EXO")?;
 
-    let url = format!(
-        "{}/v1/chat/completions",
-        args.exo_url.trim_end_matches('/')
-    );
+    let url = format!("{}/v1/chat/completions", args.exo_url.trim_end_matches('/'));
 
     let mut body = json!({
         "model": model,

@@ -150,9 +150,7 @@ pub fn find_process_using_port(port: u16) -> Result<Option<String>> {
         .context("Failed to run lsof")?;
 
     if output.status.success() {
-        let pid = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .to_string();
+        let pid = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
         if !pid.is_empty() {
             // Get process name
@@ -190,8 +188,7 @@ pub fn get_memory_info() -> Result<MemoryInfo> {
         .context("Failed to parse memory size")?;
 
     // Get memory pressure (simplified - real impl would use vm_stat)
-    let output = Command::new("memory_pressure")
-        .output();
+    let output = Command::new("memory_pressure").output();
 
     let pressure = match output {
         Ok(o) if o.status.success() => {

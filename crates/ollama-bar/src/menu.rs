@@ -7,9 +7,7 @@ use llm_core::{OllamaStatus, TailscaleStatus};
 use objc2::rc::Retained;
 use objc2::runtime::Sel;
 use objc2::{msg_send, msg_send_id, sel};
-use objc2_app_kit::{
-    NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
-};
+use objc2_app_kit::{NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength};
 use objc2_foundation::{MainThreadMarker, NSString};
 use std::time::Duration;
 

@@ -2,8 +2,8 @@
 
 use crate::notifications::Notification;
 use crate::state::AppState;
-use objc2::rc::Retained;
 use objc2::msg_send_id;
+use objc2::rc::Retained;
 use objc2_app_kit::{NSAlert, NSAlertStyle, NSTextField};
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
 
@@ -23,10 +23,7 @@ pub fn show_pull_model_dialog(mtm: MainThreadMarker) -> Option<String> {
         alert.addButtonWithTitle(&NSString::from_str("Cancel"));
 
         // Create text field for input
-        let frame = NSRect::new(
-            NSPoint::new(0.0, 0.0),
-            NSSize::new(300.0, 24.0),
-        );
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(300.0, 24.0));
         let text_field: Retained<NSTextField> = msg_send_id![
             mtm.alloc::<NSTextField>(),
             initWithFrame: frame
@@ -57,6 +54,7 @@ pub fn show_pull_model_dialog(mtm: MainThreadMarker) -> Option<String> {
 }
 
 /// Show an error alert
+#[allow(dead_code)]
 pub fn show_error_alert(mtm: MainThreadMarker, title: &str, message: &str) {
     unsafe {
         let alert = NSAlert::new(mtm);
@@ -69,6 +67,7 @@ pub fn show_error_alert(mtm: MainThreadMarker, title: &str, message: &str) {
 }
 
 /// Show a confirmation dialog
+#[allow(dead_code)]
 pub fn show_confirmation(mtm: MainThreadMarker, title: &str, message: &str) -> bool {
     unsafe {
         let alert = NSAlert::new(mtm);

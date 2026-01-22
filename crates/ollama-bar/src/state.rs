@@ -60,18 +60,19 @@ impl AppState {
 
         // Check Ollama status
         let ollama_status = ollama_client.status().await;
-        let (current_model, available_models, memory_used) = if ollama_status == OllamaStatus::Running {
-            let models = ollama_client.list_models().await.unwrap_or_default();
-            let running = ollama_client.list_running().await.unwrap_or_default();
+        let (current_model, available_models, memory_used) =
+            if ollama_status == OllamaStatus::Running {
+                let models = ollama_client.list_models().await.unwrap_or_default();
+                let running = ollama_client.list_running().await.unwrap_or_default();
 
-            let current = running.first().map(|m| m.name.clone());
-            let names: Vec<String> = models.iter().map(|m| m.name.clone()).collect();
-            let mem = running.first().map(|m| m.size as f64 / 1e9).unwrap_or(0.0);
+                let current = running.first().map(|m| m.name.clone());
+                let names: Vec<String> = models.iter().map(|m| m.name.clone()).collect();
+                let mem = running.first().map(|m| m.size as f64 / 1e9).unwrap_or(0.0);
 
-            (current, names, mem)
-        } else {
-            (None, Vec::new(), 0.0)
-        };
+                (current, names, mem)
+            } else {
+                (None, Vec::new(), 0.0)
+            };
 
         // Check Tailscale status
         let tailscale_status = tailscale_client.status();
@@ -125,6 +126,7 @@ impl AppState {
         }
     }
 
+    #[allow(dead_code)]
     pub fn ollama_url(&self) -> String {
         self.inner.lock().unwrap().config.ollama_url()
     }
@@ -139,7 +141,12 @@ impl AppState {
             (
                 inner.config.ollama.host.clone(),
                 inner.config.ollama.port,
-                inner.config.ollama.ollama_home.to_string_lossy().to_string(),
+                inner
+                    .config
+                    .ollama
+                    .ollama_home
+                    .to_string_lossy()
+                    .to_string(),
             )
         };
 

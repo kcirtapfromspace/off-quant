@@ -96,8 +96,7 @@ impl TailscaleClient {
             );
         }
 
-        serde_json::from_slice(&output.stdout)
-            .context("Failed to parse tailscale status JSON")
+        serde_json::from_slice(&output.stdout).context("Failed to parse tailscale status JSON")
     }
 
     /// Get IPv4 address on tailnet
@@ -114,9 +113,7 @@ impl TailscaleClient {
             );
         }
 
-        let ip = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .to_string();
+        let ip = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
         if ip.is_empty() {
             anyhow::bail!("No Tailscale IPv4 address found");
@@ -139,9 +136,7 @@ impl TailscaleClient {
             );
         }
 
-        let ip = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .to_string();
+        let ip = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
         if ip.is_empty() {
             anyhow::bail!("No Tailscale IPv6 address found");
