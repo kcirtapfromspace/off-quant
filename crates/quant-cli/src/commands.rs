@@ -22,7 +22,9 @@ const GREEN: &str = "\x1b[92m";
 const RED: &str = "\x1b[91m";
 const YELLOW: &str = "\x1b[93m";
 const BLUE: &str = "\x1b[94m";
+const CYAN: &str = "\x1b[96m";
 const BOLD: &str = "\x1b[1m";
+const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 
 fn print_status(ok: bool, msg: &str) {
@@ -906,7 +908,11 @@ pub async fn agent(
     auto: bool,
     max_iterations: usize,
     quiet: bool,
+    resume: Option<String>,
+    no_save: bool,
 ) -> Result<()> {
+    use crate::session::{Session, SessionStore};
+
     // Load config, fall back to defaults
     let (config, _) = match Config::try_load() {
         Some(cfg) => (cfg, None),
@@ -932,6 +938,18 @@ pub async fn agent(
             "llama3.2".to_string()
         }
     });
+
+    // Handle session resume
+    let session_store = SessionStore::new()?;
+    let mut session = if let Some(ref session_id) = resume {
+        if !quiet {
+            println!("{}Resuming session:{} {}", DIM, RESET, session_id);
+        }
+        session_store.load(session_id)?
+    } else {
+        let working_dir = std::env::current_dir().ok();
+        Session::new(&model, working_dir)
+    };
 
     // Create tool registry and router
     let registry = create_default_registry();
@@ -963,10 +981,36 @@ pub async fn agent(
         println!("  Model: {}", model);
         println!("  Task: {}", task);
         println!("  Auto mode: {}", if auto { "yes" } else { "no" });
+        if resume.is_some() {
+            println!("  Session: {}", session.id);
+        }
         println!();
     }
 
     let state = agent.run(task).await?;
+
+    // Save session messages
+    for msg in &state.messages {
+        session.add_message(msg.clone());
+    }
+
+    // Generate a summary from the final response
+    if let Some(ref response) = state.final_response {
+        let summary = if response.len() > 100 {
+            format!("{}...", &response[..97])
+        } else {
+            response.clone()
+        };
+        session.set_summary(summary);
+    }
+
+    // Save session (unless --no-save)
+    if !no_save {
+        session_store.save(&session)?;
+        if !quiet {
+            println!("{}Session saved:{} {}", DIM, RESET, session.id);
+        }
+    }
 
     // Print results
     if let Some(response) = state.final_response {
@@ -989,4 +1033,158 @@ pub async fn agent(
     }
 
     Ok(())
+}
+
+/// List saved sessions
+pub async fn sessions_list(project_only: bool, json: bool) -> Result<()> {
+    use crate::session::SessionStore;
+
+    let store = SessionStore::new()?;
+
+    let sessions = if project_only {
+        let cwd = std::env::current_dir()?;
+        store.find_by_project(&cwd)?
+    } else {
+        store.list()?
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&sessions)?);
+        return Ok(());
+    }
+
+    if sessions.is_empty() {
+        println!("No saved sessions found.");
+        if project_only {
+            println!("{}Tip:{} Use `quant sessions list` to see all sessions.", DIM, RESET);
+        }
+        return Ok(());
+    }
+
+    println!("{}Saved Sessions:{}", BOLD, RESET);
+    println!();
+
+    for s in sessions {
+        let project = s.project_root
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "-".to_string());
+
+        println!(
+            "  {}{}{}  {} msgs  {}  {}",
+            CYAN, s.id, RESET,
+            s.message_count,
+            s.model,
+            project
+        );
+        if let Some(summary) = &s.summary {
+            let truncated = if summary.len() > 60 {
+                format!("{}...", &summary[..57])
+            } else {
+                summary.clone()
+            };
+            println!("    {}{}{}", DIM, truncated, RESET);
+        }
+    }
+
+    println!();
+    println!("{}Resume with:{} quant sessions resume <id>", DIM, RESET);
+
+    Ok(())
+}
+
+/// Show details of a session
+pub async fn sessions_show(id: &str) -> Result<()> {
+    use crate::session::SessionStore;
+
+    let store = SessionStore::new()?;
+    let session = store.load(id)?;
+
+    println!("{}Session:{} {}", BOLD, RESET, session.id);
+    println!("  Name: {}", session.name);
+    println!("  Model: {}", session.model);
+    println!("  Created: {}", session.created_at.format("%Y-%m-%d %H:%M:%S"));
+    println!("  Updated: {}", session.updated_at.format("%Y-%m-%d %H:%M:%S"));
+    if let Some(ref root) = session.project_root {
+        println!("  Project: {}", root.display());
+    }
+    println!("  Messages: {}", session.message_count());
+
+    if let Some(ref summary) = session.summary {
+        println!();
+        println!("{}Summary:{}", BOLD, RESET);
+        println!("  {}", summary);
+    }
+
+    println!();
+    println!("{}Messages:{}", BOLD, RESET);
+    for (i, msg) in session.messages.iter().enumerate() {
+        let role = format!("{:?}", msg.role).to_lowercase();
+        let content = if msg.content.len() > 100 {
+            format!("{}...", &msg.content[..97])
+        } else {
+            msg.content.clone()
+        };
+        println!("  {}. [{}] {}", i + 1, role, content);
+    }
+
+    Ok(())
+}
+
+/// Delete a session
+pub async fn sessions_rm(id: &str) -> Result<()> {
+    use crate::session::SessionStore;
+
+    let store = SessionStore::new()?;
+    store.delete(id)?;
+    println!("{}Deleted session:{} {}", GREEN, RESET, id);
+    Ok(())
+}
+
+/// Resume a session
+pub async fn sessions_resume(id: &str, auto: bool) -> Result<()> {
+    use crate::session::SessionStore;
+
+    let store = SessionStore::new()?;
+
+    // Handle "latest" as alias for most recent session
+    let session_id = if id == "latest" {
+        let sessions = store.list()?;
+        sessions.first()
+            .map(|s| s.id.clone())
+            .ok_or_else(|| anyhow::anyhow!("No sessions found"))?
+    } else {
+        id.to_string()
+    };
+
+    let session = store.load(&session_id)?;
+
+    println!("{}Resuming session:{} {}", BOLD, RESET, session.id);
+    println!("  Model: {}", session.model);
+    println!("  Messages: {}", session.message_count());
+    println!();
+    println!("Enter your next task or question:");
+
+    // Read task from stdin
+    let mut task = String::new();
+    std::io::stdin().read_line(&mut task)?;
+    let task = task.trim();
+
+    if task.is_empty() {
+        println!("{}No task provided, exiting.{}", YELLOW, RESET);
+        return Ok(());
+    }
+
+    // Run agent with resumed session
+    agent(
+        task,
+        Some(session.model.clone()),
+        None,
+        auto,
+        50,
+        false,
+        Some(session_id),
+        false,
+    ).await
 }

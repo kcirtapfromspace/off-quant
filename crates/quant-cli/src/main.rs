@@ -7,7 +7,10 @@ mod commands;
 mod config;
 mod context;
 mod conversation;
+mod progress;
+mod project;
 mod repl;
+mod session;
 mod tools;
 
 use anyhow::Result;
@@ -174,6 +177,20 @@ enum Commands {
         /// Quiet mode (less verbose output)
         #[arg(short, long)]
         quiet: bool,
+
+        /// Resume a previous session
+        #[arg(long)]
+        resume: Option<String>,
+
+        /// Don't save this session
+        #[arg(long)]
+        no_save: bool,
+    },
+
+    /// Manage conversation sessions
+    Sessions {
+        #[command(subcommand)]
+        action: SessionAction,
     },
 }
 
@@ -237,6 +254,39 @@ enum ContextAction {
     },
     /// Clear all context
     Clear,
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionAction {
+    /// List saved sessions
+    List {
+        /// Show only sessions for current project
+        #[arg(long)]
+        project: bool,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show details of a session
+    Show {
+        /// Session ID
+        id: String,
+    },
+    /// Delete a session
+    Rm {
+        /// Session ID
+        id: String,
+    },
+    /// Resume a session (alias for `agent --resume`)
+    Resume {
+        /// Session ID (or "latest" for most recent)
+        id: String,
+
+        /// Auto-approve all tool executions
+        #[arg(long)]
+        auto: bool,
+    },
 }
 
 #[tokio::main]
@@ -325,9 +375,17 @@ async fn main() -> Result<()> {
             auto,
             max_iterations,
             quiet,
+            resume,
+            no_save,
         }) => {
             let task_text = task.join(" ");
-            commands::agent(&task_text, model, system, auto, max_iterations, quiet).await
+            commands::agent(&task_text, model, system, auto, max_iterations, quiet, resume, no_save).await
+        }
+        Some(Commands::Sessions { action }) => match action {
+            SessionAction::List { project, json } => commands::sessions_list(project, json).await,
+            SessionAction::Show { id } => commands::sessions_show(&id).await,
+            SessionAction::Rm { id } => commands::sessions_rm(&id).await,
+            SessionAction::Resume { id, auto } => commands::sessions_resume(&id, auto).await,
         }
         None => {
             // Default to chat REPL when no command specified
