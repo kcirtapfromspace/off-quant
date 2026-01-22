@@ -3,6 +3,7 @@
 //! Provides a Claude Code-like experience for local LLMs via Ollama.
 
 mod commands;
+mod config;
 mod context;
 mod conversation;
 mod repl;
@@ -133,6 +134,31 @@ enum Commands {
 
     /// Show detailed version and system info
     Info,
+
+    /// Manage user configuration
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigAction {
+    /// Create default config file
+    Init,
+    /// Show current configuration
+    Show,
+    /// Print config file path
+    Path,
+    /// Edit config file (opens in $EDITOR)
+    Edit,
 }
 
 #[derive(Debug, Subcommand)]
@@ -250,6 +276,20 @@ async fn main() -> Result<()> {
         Some(Commands::Env { output }) => commands::env(&output).await,
         Some(Commands::Run { model }) => commands::run(model).await,
         Some(Commands::Info) => commands::info().await,
+        Some(Commands::Config { action }) => match action {
+            ConfigAction::Init => commands::config_init().await,
+            ConfigAction::Show => commands::config_show().await,
+            ConfigAction::Path => commands::config_path().await,
+            ConfigAction::Edit => commands::config_edit().await,
+        },
+        Some(Commands::Completions { shell }) => {
+            use clap::CommandFactory;
+            use clap_complete::generate;
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            generate(shell, &mut cmd, name, &mut std::io::stdout());
+            Ok(())
+        }
         None => {
             // Default to chat REPL when no command specified
             repl::run(None, None, None).await
