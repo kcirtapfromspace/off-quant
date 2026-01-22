@@ -170,8 +170,20 @@ impl AgentLoop {
                     }
                 }
 
-                // Check if done
+                // Check if done - extract token usage from final chunk
                 if chunk.done {
+                    // Record token usage
+                    state.record_tokens(
+                        chunk.prompt_eval_count.unwrap_or(0),
+                        chunk.eval_count.unwrap_or(0),
+                        chunk.total_duration.unwrap_or(0),
+                        chunk.eval_duration.unwrap_or(0),
+                    );
+                    debug!(
+                        prompt_tokens = chunk.prompt_eval_count,
+                        completion_tokens = chunk.eval_count,
+                        "Recorded token usage"
+                    );
                     break;
                 }
             }
@@ -346,9 +358,23 @@ impl AgentLoop {
             ));
         }
 
+        // Display token usage summary
+        if self.config.verbose && state.token_usage.call_count > 0 {
+            println!();
+            println!(
+                "{}[Usage]{} {}",
+                DIM,
+                RESET,
+                state.token_usage.summary()
+            );
+        }
+
         info!(
             finished = state.finished,
             iterations = state.iteration,
+            prompt_tokens = state.token_usage.prompt_tokens,
+            completion_tokens = state.token_usage.completion_tokens,
+            total_tokens = state.token_usage.total_tokens(),
             error = ?state.error,
             "Agent loop completed"
         );
