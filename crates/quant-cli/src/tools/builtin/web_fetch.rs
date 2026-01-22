@@ -4,24 +4,49 @@ use anyhow::Result;
 use async_trait::async_trait;
 use scraper::{Html, Selector};
 use serde_json::Value;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::time::Duration;
+use tracing::{debug, instrument, warn};
 
 use crate::tools::{ParameterProperty, ParameterSchema, SecurityLevel, Tool, ToolContext, ToolResult};
 
-/// Tool for fetching web content
-pub struct WebFetchTool {
-    client: reqwest::Client,
+/// Check if an IP address is in a private/reserved range (SSRF protection)
+fn is_private_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ipv4) => {
+            ipv4.is_loopback()           // 127.0.0.0/8
+                || ipv4.is_private()     // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+                || ipv4.is_link_local()  // 169.254.0.0/16
+                || ipv4.is_broadcast()   // 255.255.255.255
+                || ipv4.is_unspecified() // 0.0.0.0
+                || ipv4.octets()[0] == 100 && (ipv4.octets()[1] & 0xC0) == 64  // 100.64.0.0/10 (CGNAT)
+        }
+        IpAddr::V6(ipv6) => {
+            ipv6.is_loopback()           // ::1
+                || ipv6.is_unspecified() // ::
+                // Check for IPv4-mapped addresses
+                || ipv6.to_ipv4_mapped().map(|v4| {
+                    v4.is_loopback() || v4.is_private() || v4.is_link_local()
+                }).unwrap_or(false)
+        }
+    }
 }
+
+/// Tool for fetching web content
+pub struct WebFetchTool;
 
 impl WebFetchTool {
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
+        Self
+    }
+
+    /// Create an HTTP client with the given timeout
+    fn create_client(timeout_secs: u64) -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout_secs))
             .user_agent("Mozilla/5.0 (compatible; QuantCLI/1.0)")
             .build()
-            .expect("Failed to create HTTP client");
-
-        Self { client }
+            .expect("Failed to create HTTP client")
     }
 }
 
@@ -52,10 +77,14 @@ impl Tool for WebFetchTool {
             .with_property("selector", ParameterProperty::string("CSS selector to extract specific content"))
     }
 
-    async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolResult> {
+    #[instrument(skip(self, args, ctx), fields(url = tracing::field::Empty))]
+    async fn execute(&self, args: &Value, ctx: &ToolContext) -> Result<ToolResult> {
         let url = args.get("url")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: url"))?;
+
+        // Record URL in span (truncate for safety)
+        tracing::Span::current().record("url", &url.chars().take(100).collect::<String>().as_str());
 
         let raw = args.get("raw")
             .and_then(|v| v.as_bool())
@@ -64,10 +93,18 @@ impl Tool for WebFetchTool {
         let selector = args.get("selector")
             .and_then(|v| v.as_str());
 
+        debug!(raw, selector = ?selector, timeout_secs = ctx.http_timeout_secs, "Fetch parameters");
+
+        // Create client with context timeout
+        let client = Self::create_client(ctx.http_timeout_secs);
+
         // Validate URL
         let parsed_url = match url::Url::parse(url) {
             Ok(u) => u,
-            Err(e) => return Ok(ToolResult::error(format!("Invalid URL: {}", e))),
+            Err(e) => {
+                warn!(url, error = %e, "Invalid URL");
+                return Ok(ToolResult::error(format!("Invalid URL: {}", e)));
+            }
         };
 
         // Only allow HTTP(S)
@@ -75,14 +112,40 @@ impl Tool for WebFetchTool {
             return Ok(ToolResult::error("Only HTTP and HTTPS URLs are supported"));
         }
 
+        // P1 Security: SSRF protection - block private/reserved IP ranges
+        if let Some(host) = parsed_url.host_str() {
+            // Try to resolve hostname to check IP addresses
+            let port = parsed_url.port().unwrap_or(if parsed_url.scheme() == "https" { 443 } else { 80 });
+            let addr_str = format!("{}:{}", host, port);
+
+            if let Ok(addrs) = addr_str.to_socket_addrs() {
+                for addr in addrs {
+                    if is_private_ip(&addr.ip()) {
+                        warn!(host, ip = %addr.ip(), "SSRF protection blocked private IP");
+                        return Ok(ToolResult::error(format!(
+                            "SSRF protection: Access to private/reserved IP address {} is blocked",
+                            addr.ip()
+                        )));
+                    }
+                }
+            }
+            // If resolution fails, we'll let the actual fetch handle it
+        }
+
         // Fetch the URL
-        let response = match self.client.get(url).send().await {
+        debug!("Sending HTTP request");
+        let response = match client.get(url).send().await {
             Ok(r) => r,
-            Err(e) => return Ok(ToolResult::error(format!("Failed to fetch URL: {}", e))),
+            Err(e) => {
+                warn!(error = %e, "Failed to fetch URL");
+                return Ok(ToolResult::error(format!("Failed to fetch URL: {}", e)));
+            }
         };
 
         let status = response.status();
+        debug!(status = %status, "HTTP response received");
         if !status.is_success() {
+            warn!(status = %status, "HTTP error response");
             return Ok(ToolResult::error(format!("HTTP error: {}", status)));
         }
 
@@ -118,12 +181,19 @@ impl Tool for WebFetchTool {
             body
         };
 
-        // Truncate if too long
+        // Truncate if too long (UTF-8 safe)
         let output = if output.len() > ctx.max_output_len {
+            // Find a safe truncation point at a char boundary
+            let safe_end = output
+                .char_indices()
+                .take_while(|(idx, _)| *idx < ctx.max_output_len)
+                .last()
+                .map(|(idx, c)| idx + c.len_utf8())
+                .unwrap_or(0);
             format!(
                 "{}\n\n[Content truncated at {} characters]",
-                &output[..ctx.max_output_len],
-                ctx.max_output_len
+                &output[..safe_end],
+                safe_end
             )
         } else {
             output

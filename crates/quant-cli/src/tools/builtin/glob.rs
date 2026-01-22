@@ -32,7 +32,7 @@ impl Tool for GlobTool {
             .with_property("limit", ParameterProperty::number("Maximum number of results to return (default: 100)").with_default(Value::Number(100.into())))
     }
 
-    async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolResult> {
+    async fn execute(&self, args: &Value, ctx: &ToolContext) -> Result<ToolResult> {
         let pattern = args.get("pattern")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: pattern"))?;
@@ -134,7 +134,7 @@ mod tests {
         let ctx = ToolContext::new(base.to_path_buf());
         let args = json!({ "pattern": "**/*.rs" });
 
-        let result = tool.execute(args, &ctx).await.unwrap();
+        let result = tool.execute(&args, &ctx).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("main.rs"));
         assert!(result.output.contains("lib.rs"));
@@ -149,7 +149,7 @@ mod tests {
         let ctx = ToolContext::new(temp_dir.path().to_path_buf());
         let args = json!({ "pattern": "**/*.xyz" });
 
-        let result = tool.execute(args, &ctx).await.unwrap();
+        let result = tool.execute(&args, &ctx).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("No files found"));
     }
@@ -168,7 +168,7 @@ mod tests {
         let ctx = ToolContext::new(base.to_path_buf());
         let args = json!({ "pattern": "*.txt", "limit": 5 });
 
-        let result = tool.execute(args, &ctx).await.unwrap();
+        let result = tool.execute(&args, &ctx).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("truncated"));
     }

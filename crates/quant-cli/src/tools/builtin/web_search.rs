@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use scraper::{Html, Selector};
 use serde_json::Value;
 use std::time::Duration;
+use tracing::{debug, instrument, warn};
 
 use crate::tools::{ParameterProperty, ParameterSchema, SecurityLevel, Tool, ToolContext, ToolResult};
 
@@ -31,19 +32,25 @@ impl Tool for WebSearchTool {
             .with_property("limit", ParameterProperty::number("Maximum number of results (default: 10)").with_default(Value::Number(10.into())))
     }
 
-    async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<ToolResult> {
+    #[instrument(skip(self, args, ctx), fields(query = tracing::field::Empty))]
+    async fn execute(&self, args: &Value, ctx: &ToolContext) -> Result<ToolResult> {
         let query = args.get("query")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: query"))?;
+
+        // Record query in span (truncate for safety)
+        tracing::Span::current().record("query", &query.chars().take(50).collect::<String>().as_str());
 
         let limit = args.get("limit")
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
             .unwrap_or(10);
 
+        debug!(limit, timeout_secs = ctx.http_timeout_secs, "Web search parameters");
+
         // Use DuckDuckGo HTML search (no API key required)
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(ctx.http_timeout_secs))
             .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
             .build()?;
 
@@ -52,12 +59,17 @@ impl Tool for WebSearchTool {
             urlencoding::encode(query)
         );
 
+        debug!("Sending search request to DuckDuckGo");
         let response = match client.get(&search_url).send().await {
             Ok(r) => r,
-            Err(e) => return Ok(ToolResult::error(format!("Search request failed: {}", e))),
+            Err(e) => {
+                warn!(error = %e, "Search request failed");
+                return Ok(ToolResult::error(format!("Search request failed: {}", e)));
+            }
         };
 
         if !response.status().is_success() {
+            warn!(status = %response.status(), "Search returned error status");
             return Ok(ToolResult::error(format!("Search failed with status: {}", response.status())));
         }
 

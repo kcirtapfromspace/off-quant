@@ -7,6 +7,7 @@ use llm_core::{
     ChatMessageWithTools, ChatOptions, FunctionDefinition as LlmFunctionDefinition, OllamaClient,
     Role, ToolDefinition as OllamaToolDefinition,
 };
+use tracing::{debug, info, instrument, warn};
 
 use crate::tools::router::{RouteResult, ToolRouter};
 use crate::tools::{ToolCall, ToolContext};
@@ -39,7 +40,9 @@ impl AgentLoop {
     }
 
     /// Run the agent with a task
+    #[instrument(skip(self), fields(model = %self.config.model))]
     pub async fn run(&self, task: &str) -> Result<AgentState> {
+        info!(task_len = task.len(), max_iterations = self.config.max_iterations, "Starting agent loop");
         let mut state = AgentState::new();
 
         // Add system prompt if configured
@@ -73,15 +76,13 @@ impl AgentLoop {
         let tool_defs = self.get_tool_definitions();
 
         // Create tool context
-        let tool_ctx = ToolContext {
-            working_dir: self.config.working_dir.clone(),
-            auto_mode: self.config.auto_mode,
-            max_output_len: 50000,
-        };
+        let tool_ctx = ToolContext::new(self.config.working_dir.clone())
+            .with_auto_mode(self.config.auto_mode);
 
         // Main agent loop
         while !state.finished && state.iteration < self.config.max_iterations {
             state.increment_iteration();
+            debug!(iteration = state.iteration, messages = state.messages.len(), "Starting iteration");
 
             if self.config.verbose {
                 print!(
@@ -92,6 +93,7 @@ impl AgentLoop {
             }
 
             // Call the LLM with tools
+            debug!("Calling LLM with tools");
             let response = match self
                 .client
                 .chat_with_tools(
@@ -104,6 +106,7 @@ impl AgentLoop {
             {
                 Ok(r) => r,
                 Err(e) => {
+                    warn!(error = %e, "LLM request failed");
                     state.mark_error(format!("LLM error: {}", e));
                     break;
                 }
@@ -114,6 +117,7 @@ impl AgentLoop {
             // Check if LLM wants to call tools
             if message.tool_calls.is_empty() {
                 // No tool calls - LLM is done
+                info!(iterations = state.iteration, "Agent completed task");
                 if self.config.verbose {
                     println!("{}Done{}", GREEN, RESET);
                 }
@@ -142,11 +146,13 @@ impl AgentLoop {
             });
 
             // Execute each tool call
+            debug!(tool_count = message.tool_calls.len(), "Processing tool calls");
             for tool_call in &message.tool_calls {
                 let call = ToolCall {
                     name: tool_call.function.name.clone(),
                     arguments: tool_call.function.arguments.clone(),
                 };
+                debug!(tool = %call.name, "Executing tool call");
 
                 if self.config.verbose {
                     println!();
@@ -222,11 +228,19 @@ impl AgentLoop {
 
         // Check if we hit max iterations
         if !state.finished && state.iteration >= self.config.max_iterations {
+            warn!(max_iterations = self.config.max_iterations, "Agent reached maximum iterations");
             state.mark_error(format!(
                 "Agent reached maximum iterations ({})",
                 self.config.max_iterations
             ));
         }
+
+        info!(
+            finished = state.finished,
+            iterations = state.iteration,
+            error = ?state.error,
+            "Agent loop completed"
+        );
 
         Ok(state)
     }

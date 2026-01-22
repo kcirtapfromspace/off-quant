@@ -32,7 +32,7 @@ impl Tool for FileWriteTool {
             .with_property("append", ParameterProperty::boolean("Append to file instead of overwriting (default: false)"))
     }
 
-    async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolResult> {
+    async fn execute(&self, args: &Value, ctx: &ToolContext) -> Result<ToolResult> {
         let path_str = args.get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: path"))?;
@@ -111,7 +111,7 @@ mod tests {
             "content": "Hello, World!"
         });
 
-        let result = tool.execute(args, &ctx).await.unwrap();
+        let result = tool.execute(&args, &ctx).await.unwrap();
         assert!(result.success);
 
         let content = fs::read_to_string(&file_path).unwrap();
@@ -130,7 +130,7 @@ mod tests {
             "content": "nested content"
         });
 
-        let result = tool.execute(args, &ctx).await.unwrap();
+        let result = tool.execute(&args, &ctx).await.unwrap();
         assert!(result.success);
         assert!(file_path.exists());
     }
@@ -151,7 +151,7 @@ mod tests {
             "append": true
         });
 
-        let result = tool.execute(args, &ctx).await.unwrap();
+        let result = tool.execute(&args, &ctx).await.unwrap();
         assert!(result.success);
 
         let content = fs::read_to_string(&file_path).unwrap();

@@ -92,7 +92,7 @@ mod tests {
             ParameterSchema::new()
         }
 
-        async fn execute(&self, _args: Value, _ctx: &ToolContext) -> Result<ToolResult> {
+        async fn execute(&self, _args: &Value, _ctx: &ToolContext) -> Result<ToolResult> {
             Ok(ToolResult::success("mock output"))
         }
     }

@@ -32,7 +32,7 @@ impl Tool for FileReadTool {
             .with_property("limit", ParameterProperty::number("Maximum number of lines to read (default: unlimited)"))
     }
 
-    async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolResult> {
+    async fn execute(&self, args: &Value, ctx: &ToolContext) -> Result<ToolResult> {
         let path_str = args.get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: path"))?;
@@ -90,12 +90,19 @@ impl Tool for FileReadTool {
             header + &selected_lines.join("\n")
         };
 
-        // Truncate if too long
+        // Truncate if too long (UTF-8 safe)
         let output = if output.len() > ctx.max_output_len {
+            // Find a safe truncation point at a char boundary
+            let safe_end = output
+                .char_indices()
+                .take_while(|(idx, _)| *idx < ctx.max_output_len)
+                .last()
+                .map(|(idx, c)| idx + c.len_utf8())
+                .unwrap_or(0);
             format!(
                 "{}\n\n[Output truncated at {} characters]",
-                &output[..ctx.max_output_len],
-                ctx.max_output_len
+                &output[..safe_end],
+                safe_end
             )
         } else {
             output
@@ -123,7 +130,7 @@ mod tests {
         let ctx = ToolContext::default();
         let args = json!({ "path": temp.path().to_str().unwrap() });
 
-        let result = tool.execute(args, &ctx).await.unwrap();
+        let result = tool.execute(&args, &ctx).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("line 1"));
         assert!(result.output.contains("line 2"));
@@ -145,7 +152,7 @@ mod tests {
             "limit": 2
         });
 
-        let result = tool.execute(args, &ctx).await.unwrap();
+        let result = tool.execute(&args, &ctx).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("line 3"));
         assert!(result.output.contains("line 4"));
@@ -158,7 +165,7 @@ mod tests {
         let ctx = ToolContext::default();
         let args = json!({ "path": "/nonexistent/path/file.txt" });
 
-        let result = tool.execute(args, &ctx).await.unwrap();
+        let result = tool.execute(&args, &ctx).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("File not found"));
     }
