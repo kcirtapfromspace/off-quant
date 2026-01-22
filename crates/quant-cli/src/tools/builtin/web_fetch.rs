@@ -5,10 +5,27 @@ use async_trait::async_trait;
 use scraper::{Html, Selector};
 use serde_json::Value;
 use std::net::{IpAddr, ToSocketAddrs};
+use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::{debug, instrument, warn};
 
 use crate::tools::{ParameterProperty, ParameterSchema, SecurityLevel, Tool, ToolContext, ToolResult};
+
+/// Shared HTTP client for connection pooling
+/// Using OnceLock for lazy initialization with a longer timeout for general use
+static SHARED_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn get_shared_client() -> &'static reqwest::Client {
+    SHARED_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .pool_max_idle_per_host(10)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .timeout(Duration::from_secs(30))
+            .user_agent("Mozilla/5.0 (compatible; QuantCLI/1.0)")
+            .build()
+            .expect("Failed to create HTTP client")
+    })
+}
 
 /// Check if an IP address is in a private/reserved range (SSRF protection)
 fn is_private_ip(ip: &IpAddr) -> bool {
@@ -38,15 +55,6 @@ pub struct WebFetchTool;
 impl WebFetchTool {
     pub fn new() -> Self {
         Self
-    }
-
-    /// Create an HTTP client with the given timeout
-    fn create_client(timeout_secs: u64) -> reqwest::Client {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout_secs))
-            .user_agent("Mozilla/5.0 (compatible; QuantCLI/1.0)")
-            .build()
-            .expect("Failed to create HTTP client")
     }
 }
 
@@ -95,8 +103,8 @@ impl Tool for WebFetchTool {
 
         debug!(raw, selector = ?selector, timeout_secs = ctx.http_timeout_secs, "Fetch parameters");
 
-        // Create client with context timeout
-        let client = Self::create_client(ctx.http_timeout_secs);
+        // Use shared client for connection pooling
+        let client = get_shared_client();
 
         // Validate URL
         let parsed_url = match url::Url::parse(url) {
@@ -132,9 +140,14 @@ impl Tool for WebFetchTool {
             // If resolution fails, we'll let the actual fetch handle it
         }
 
-        // Fetch the URL
+        // Fetch the URL with per-request timeout from context
         debug!("Sending HTTP request");
-        let response = match client.get(url).send().await {
+        let response = match client
+            .get(url)
+            .timeout(Duration::from_secs(ctx.http_timeout_secs))
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 warn!(error = %e, "Failed to fetch URL");

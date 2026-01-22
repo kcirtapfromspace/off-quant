@@ -1,11 +1,16 @@
 //! Security and confirmation handling for tools
 
 use async_trait::async_trait;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::{SecurityLevel, ToolCall};
+
+/// Check if stdin is connected to a terminal
+pub fn is_interactive() -> bool {
+    io::stdin().is_terminal()
+}
 
 /// Result of a confirmation prompt
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +65,21 @@ impl ConfirmationHandler for TerminalConfirmation {
         // Safe tools don't need confirmation
         if security_level == SecurityLevel::Safe {
             return ConfirmationResult::Approved;
+        }
+
+        // P2: TTY detection - if not interactive, deny dangerous actions
+        if !is_interactive() {
+            warn!(
+                tool = %tool_call.name,
+                security_level = %security_level,
+                "Non-interactive mode: denying tool that requires confirmation"
+            );
+            eprintln!(
+                "\x1b[93m[Warning]\x1b[0m Non-interactive mode: tool '{}' ({}) requires confirmation but stdin is not a TTY.",
+                tool_call.name, security_level
+            );
+            eprintln!("Use --auto flag to bypass confirmations in non-interactive mode.");
+            return ConfirmationResult::Denied;
         }
 
         // Display the tool call
@@ -173,5 +193,12 @@ mod tests {
 
         let result = handler.confirm(&tool_call, SecurityLevel::Dangerous).await;
         assert_eq!(result, ConfirmationResult::Approved);
+    }
+
+    #[test]
+    fn test_is_interactive_in_test() {
+        // In test environment, stdin is typically not a terminal
+        // This test just ensures the function works without crashing
+        let _result = super::is_interactive();
     }
 }
