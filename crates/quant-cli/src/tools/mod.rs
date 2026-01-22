@@ -85,6 +85,10 @@ pub struct ToolContext {
     pub auto_mode: bool,
     /// Maximum output length (truncate if exceeded)
     pub max_output_len: usize,
+    /// Default timeout for command execution (bash) in seconds
+    pub command_timeout_secs: u64,
+    /// Default timeout for HTTP requests in seconds
+    pub http_timeout_secs: u64,
 }
 
 impl Default for ToolContext {
@@ -93,6 +97,8 @@ impl Default for ToolContext {
             working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             auto_mode: false,
             max_output_len: 50000,
+            command_timeout_secs: 120,
+            http_timeout_secs: 30,
         }
     }
 }
@@ -109,6 +115,18 @@ impl ToolContext {
     /// Set auto mode
     pub fn with_auto_mode(mut self, auto: bool) -> Self {
         self.auto_mode = auto;
+        self
+    }
+
+    /// Set command timeout
+    pub fn with_command_timeout(mut self, secs: u64) -> Self {
+        self.command_timeout_secs = secs;
+        self
+    }
+
+    /// Set HTTP timeout
+    pub fn with_http_timeout(mut self, secs: u64) -> Self {
+        self.http_timeout_secs = secs;
         self
     }
 }
@@ -268,7 +286,7 @@ pub trait Tool: Send + Sync {
     fn parameters_schema(&self) -> ParameterSchema;
 
     /// Execute the tool with the given arguments
-    async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolResult>;
+    async fn execute(&self, args: &Value, ctx: &ToolContext) -> Result<ToolResult>;
 
     /// Convert to a tool definition for the LLM
     fn to_definition(&self) -> ToolDefinition {

@@ -2,6 +2,8 @@
 
 use async_trait::async_trait;
 use std::io::{self, Write};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tracing::debug;
 
 use super::{SecurityLevel, ToolCall};
 
@@ -51,6 +53,7 @@ impl Default for TerminalConfirmation {
 impl ConfirmationHandler for TerminalConfirmation {
     async fn confirm(&self, tool_call: &ToolCall, security_level: SecurityLevel) -> ConfirmationResult {
         if self.auto_approve {
+            debug!(tool = %tool_call.name, "Auto-approving tool execution");
             return ConfirmationResult::Approved;
         }
 
@@ -88,18 +91,26 @@ impl ConfirmationHandler for TerminalConfirmation {
         print!("Allow this action? [y/n/s(kip)/a(bort)] ");
         io::stdout().flush().unwrap();
 
+        // Use async stdin to avoid blocking the runtime
+        let stdin = tokio::io::stdin();
+        let mut reader = BufReader::new(stdin);
         let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_err() {
+
+        if reader.read_line(&mut input).await.is_err() {
+            debug!("Failed to read stdin, aborting");
             return ConfirmationResult::Abort;
         }
 
-        match input.trim().to_lowercase().as_str() {
+        let result = match input.trim().to_lowercase().as_str() {
             "y" | "yes" | "" => ConfirmationResult::Approved,
             "n" | "no" => ConfirmationResult::Denied,
             "s" | "skip" => ConfirmationResult::Skip,
             "a" | "abort" | "q" | "quit" => ConfirmationResult::Abort,
             _ => ConfirmationResult::Denied,
-        }
+        };
+
+        debug!(tool = %tool_call.name, result = ?result, "User confirmation response");
+        result
     }
 }
 

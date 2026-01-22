@@ -6,6 +6,7 @@ use regex::Regex;
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
+use tracing::{debug, instrument, warn};
 use walkdir::WalkDir;
 
 use crate::tools::{ParameterProperty, ParameterSchema, SecurityLevel, Tool, ToolContext, ToolResult};
@@ -36,10 +37,14 @@ impl Tool for GrepTool {
             .with_property("limit", ParameterProperty::number("Maximum number of matches to return (default: 50)").with_default(Value::Number(50.into())))
     }
 
-    async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<ToolResult> {
+    #[instrument(skip(self, args, ctx), fields(pattern = tracing::field::Empty))]
+    async fn execute(&self, args: &Value, ctx: &ToolContext) -> Result<ToolResult> {
         let pattern_str = args.get("pattern")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: pattern"))?;
+
+        // Record pattern in span (truncate for safety)
+        tracing::Span::current().record("pattern", &pattern_str.chars().take(50).collect::<String>().as_str());
 
         let search_path = args.get("path")
             .and_then(|v| v.as_str())
@@ -58,6 +63,8 @@ impl Tool for GrepTool {
             .map(|v| v as usize)
             .unwrap_or(50);
 
+        debug!(path = %search_path.display(), glob = ?file_glob, case_insensitive, limit, "Grep parameters");
+
         // Compile regex
         let pattern = if case_insensitive {
             format!("(?i){}", pattern_str)
@@ -68,6 +75,7 @@ impl Tool for GrepTool {
         let regex = match Regex::new(&pattern) {
             Ok(r) => r,
             Err(e) => {
+                warn!(pattern = %pattern_str, error = %e, "Invalid regex pattern");
                 return Ok(ToolResult::error(format!("Invalid regex pattern: {}", e)));
             }
         };
@@ -216,7 +224,7 @@ mod tests {
         let ctx = ToolContext::new(base.to_path_buf());
         let args = json!({ "pattern": "println" });
 
-        let result = tool.execute(args, &ctx).await.unwrap();
+        let result = tool.execute(&args, &ctx).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("println"));
         assert!(result.output.contains("test.rs:2"));
@@ -236,7 +244,7 @@ mod tests {
             "case_insensitive": true
         });
 
-        let result = tool.execute(args, &ctx).await.unwrap();
+        let result = tool.execute(&args, &ctx).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("Found 2 matches"));
     }
@@ -257,7 +265,7 @@ mod tests {
             "glob": "*.rs"
         });
 
-        let result = tool.execute(args, &ctx).await.unwrap();
+        let result = tool.execute(&args, &ctx).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("main.rs"));
         assert!(result.output.contains("lib.rs"));
@@ -275,7 +283,7 @@ mod tests {
         let ctx = ToolContext::new(base.to_path_buf());
         let args = json!({ "pattern": "xyz123" });
 
-        let result = tool.execute(args, &ctx).await.unwrap();
+        let result = tool.execute(&args, &ctx).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("No matches found"));
     }
