@@ -175,6 +175,24 @@ impl ParameterProperty {
         }
     }
 
+    pub fn array(description: impl Into<String>) -> Self {
+        Self {
+            param_type: "array".to_string(),
+            description: description.into(),
+            enum_values: None,
+            default: None,
+        }
+    }
+
+    pub fn object(description: impl Into<String>) -> Self {
+        Self {
+            param_type: "object".to_string(),
+            description: description.into(),
+            enum_values: None,
+            default: None,
+        }
+    }
+
     pub fn with_default(mut self, value: Value) -> Self {
         self.default = Some(value);
         self

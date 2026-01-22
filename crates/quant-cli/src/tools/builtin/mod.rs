@@ -6,6 +6,8 @@ mod file_write;
 mod git;
 mod glob;
 mod grep;
+mod multi_edit;
+mod sandbox;
 mod web_fetch;
 mod web_search;
 
@@ -15,6 +17,8 @@ pub use file_write::FileWriteTool;
 pub use git::GitTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
+pub use multi_edit::MultiEditTool;
+pub use sandbox::{SandboxBackend, SandboxConfig, SandboxTool};
 pub use web_fetch::WebFetchTool;
 pub use web_search::WebSearchTool;
 
@@ -36,7 +40,9 @@ pub fn create_default_registry() -> ToolRegistry {
 
     // Dangerous tools (write/execute)
     registry.register(FileWriteTool);
+    registry.register(MultiEditTool);
     registry.register(BashTool);
+    registry.register(SandboxTool::new());
 
     registry
 }

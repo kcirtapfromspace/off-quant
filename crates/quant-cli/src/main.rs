@@ -7,6 +7,7 @@ mod commands;
 mod config;
 mod context;
 mod conversation;
+mod hooks;
 mod progress;
 mod project;
 mod repl;
