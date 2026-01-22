@@ -25,10 +25,10 @@ cors_origins = "*"
 
 [models]
 # Default model for coding tasks
-coding = "local/qwen2.5-coder-7b-q4km"
+coding = "qwen2.5-coder:7b"
 
 # Default model for chat/general tasks
-chat = "local/glm-4-9b-chat-q4k"
+chat = "glm4:9b"
 
 # Model selection thresholds (GB of RAM)
 [models.auto_select]

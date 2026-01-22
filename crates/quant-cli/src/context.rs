@@ -288,6 +288,38 @@ impl ContextManager {
         Ok(context.len() / CHARS_PER_TOKEN)
     }
 
+    /// Get token count and warning status
+    /// Returns (estimated_tokens, max_tokens, is_truncated)
+    pub fn token_status(&self) -> Result<(usize, usize, bool)> {
+        let context = self.build_context()?;
+        let estimated = context.len() / CHARS_PER_TOKEN;
+        let is_truncated = context.contains("(truncated");
+        Ok((estimated, self.config.max_tokens, is_truncated))
+    }
+
+    /// Check if context is approaching or exceeding limits
+    /// Returns a warning message if applicable
+    pub fn check_limits(&self) -> Result<Option<String>> {
+        let (tokens, max_tokens, is_truncated) = self.token_status()?;
+
+        if is_truncated {
+            return Ok(Some(format!(
+                "Context truncated: ~{} tokens (max: {}). Some files were omitted.",
+                tokens, max_tokens
+            )));
+        }
+
+        let threshold = (max_tokens as f64 * 0.8) as usize;
+        if tokens > threshold {
+            return Ok(Some(format!(
+                "Context approaching limit: ~{} tokens (max: {})",
+                tokens, max_tokens
+            )));
+        }
+
+        Ok(None)
+    }
+
     // Private helpers
 
     fn normalize_path(&self, path: &str) -> Result<String> {
