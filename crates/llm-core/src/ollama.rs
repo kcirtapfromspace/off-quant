@@ -105,7 +105,13 @@ impl OllamaClient {
     pub async fn health_check(&self) -> Result<bool> {
         let url = format!("{}/api/tags", self.base_url);
 
-        match self.client.get(&url).timeout(Duration::from_secs(5)).send().await {
+        match self
+            .client
+            .get(&url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+        {
             Ok(resp) => Ok(resp.status().is_success()),
             Err(_) => Ok(false),
         }
@@ -216,7 +222,9 @@ impl OllamaClient {
 
         self.client
             .delete(&url)
-            .json(&DeleteRequest { name: name.to_string() })
+            .json(&DeleteRequest {
+                name: name.to_string(),
+            })
             .send()
             .await
             .context("Failed to delete model")?
@@ -262,4 +270,3 @@ impl Model {
         format!("{:.1} GB", gb)
     }
 }
-

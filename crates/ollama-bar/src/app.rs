@@ -34,9 +34,7 @@ pub fn get_mtm() -> Option<MainThreadMarker> {
 /// Request a menu rebuild (called from timer)
 fn refresh_ui() {
     // Get current status
-    let new_status = APP_STATE.with(|s| {
-        s.borrow().as_ref().map(|state| state.ollama_status())
-    });
+    let new_status = APP_STATE.with(|s| s.borrow().as_ref().map(|state| state.ollama_status()));
 
     let old_status = LAST_STATUS.with(|s| *s.borrow());
 
