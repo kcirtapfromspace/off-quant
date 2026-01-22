@@ -2,7 +2,7 @@
 //!
 //! Provides:
 //! - Configuration loading (llm.toml)
-//! - Ollama API client
+//! - Ollama API client (with streaming support)
 //! - Tailscale integration
 //! - Process management
 
@@ -12,5 +12,8 @@ pub mod process;
 pub mod tailscale;
 
 pub use config::Config;
-pub use ollama::{Model, OllamaClient, OllamaStatus};
+pub use ollama::{
+    ChatChunk, ChatMessage, ChatOptions, ChatResponse, ChatStream, Model, OllamaClient,
+    OllamaStatus, Role, RunningModel,
+};
 pub use tailscale::{TailscaleClient, TailscaleStatus};

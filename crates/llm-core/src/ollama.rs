@@ -1,7 +1,9 @@
 //! Ollama API client
 
 use anyhow::{Context, Result};
+use futures::Stream;
 use serde::{Deserialize, Serialize};
+use std::pin::Pin;
 use std::time::Duration;
 
 /// Ollama service status
@@ -68,6 +70,110 @@ struct PullRequest {
     name: String,
     stream: bool,
 }
+
+/// Chat message role
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    System,
+    User,
+    Assistant,
+}
+
+/// A single chat message
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: Role,
+    pub content: String,
+}
+
+impl ChatMessage {
+    pub fn system(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::System,
+            content: content.into(),
+        }
+    }
+
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::User,
+            content: content.into(),
+        }
+    }
+
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ChatRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<ChatOptions>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ChatOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_predict: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Vec<String>>,
+}
+
+/// Response from non-streaming chat
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatResponse {
+    pub model: String,
+    pub message: ChatMessage,
+    pub done: bool,
+    #[serde(default)]
+    pub total_duration: u64,
+    #[serde(default)]
+    pub load_duration: u64,
+    #[serde(default)]
+    pub prompt_eval_count: u32,
+    #[serde(default)]
+    pub prompt_eval_duration: u64,
+    #[serde(default)]
+    pub eval_count: u32,
+    #[serde(default)]
+    pub eval_duration: u64,
+}
+
+/// Chunk from streaming chat response
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatChunk {
+    pub model: String,
+    #[serde(default)]
+    pub message: Option<ChatChunkMessage>,
+    pub done: bool,
+    #[serde(default)]
+    pub total_duration: Option<u64>,
+    #[serde(default)]
+    pub eval_count: Option<u32>,
+    #[serde(default)]
+    pub eval_duration: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatChunkMessage {
+    pub role: Role,
+    pub content: String,
+}
+
+/// Type alias for the stream of chat chunks
+pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>;
 
 #[derive(Debug, Deserialize)]
 pub struct PullProgress {
@@ -260,6 +366,105 @@ impl OllamaClient {
             .context("Model creation failed")?;
 
         Ok(())
+    }
+
+    /// Send a chat message (non-streaming)
+    pub async fn chat(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        options: Option<ChatOptions>,
+    ) -> Result<ChatResponse> {
+        let url = format!("{}/api/chat", self.base_url);
+
+        let req = ChatRequest {
+            model: model.to_string(),
+            messages: messages.to_vec(),
+            stream: false,
+            options,
+        };
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&req)
+            .timeout(Duration::from_secs(300))
+            .send()
+            .await
+            .context("Failed to send chat request")?
+            .error_for_status()
+            .context("Chat request failed")?;
+
+        resp.json().await.context("Failed to parse chat response")
+    }
+
+    /// Send a chat message with streaming response
+    pub async fn chat_stream(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        options: Option<ChatOptions>,
+    ) -> Result<ChatStream> {
+        let url = format!("{}/api/chat", self.base_url);
+
+        let req = ChatRequest {
+            model: model.to_string(),
+            messages: messages.to_vec(),
+            stream: true,
+            options,
+        };
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&req)
+            .send()
+            .await
+            .context("Failed to send chat request")?
+            .error_for_status()
+            .context("Chat request failed")?;
+
+        let stream = async_stream::try_stream! {
+            use futures::StreamExt as FuturesStreamExt;
+
+            let mut byte_stream = resp.bytes_stream();
+            let mut buffer = String::new();
+
+            while let Some(chunk_result) = FuturesStreamExt::next(&mut byte_stream).await {
+                let chunk: bytes::Bytes = chunk_result.context("Error reading stream")?;
+                let text = String::from_utf8_lossy(&chunk);
+                buffer.push_str(&text);
+
+                // Process complete lines
+                while let Some(newline_pos) = buffer.find('\n') {
+                    let line = buffer[..newline_pos].trim().to_string();
+                    buffer = buffer[newline_pos + 1..].to_string();
+
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    let chat_chunk: ChatChunk = serde_json::from_str(&line)
+                        .with_context(|| format!("Failed to parse chunk: {}", line))?;
+
+                    yield chat_chunk;
+                }
+            }
+
+            // Process any remaining content in buffer
+            if !buffer.trim().is_empty() {
+                let chat_chunk: ChatChunk = serde_json::from_str(buffer.trim())
+                    .with_context(|| format!("Failed to parse final chunk: {}", buffer))?;
+                yield chat_chunk;
+            }
+        };
+
+        Ok(Box::pin(stream))
+    }
+
+    /// Get the base URL
+    pub fn base_url(&self) -> &str {
+        &self.base_url
     }
 }
 
