@@ -973,8 +973,8 @@ pub async fn agent(
         agent_config
     };
 
-    // Create and run the agent
-    let agent = AgentLoop::new(client, router, agent_config);
+    // Create and run the agent (with MCP support)
+    let agent = AgentLoop::new_with_mcp(client, router, agent_config).await?;
 
     if !quiet {
         println!("{}Agent Mode{}", BOLD, RESET);
@@ -984,10 +984,23 @@ pub async fn agent(
         if resume.is_some() {
             println!("  Session: {}", session.id);
         }
+
+        // Show MCP info if servers are running
+        {
+            let mcp_manager = agent.mcp_manager();
+            let manager = mcp_manager.lock().await;
+            let running_servers = manager.running_servers();
+            if !running_servers.is_empty() {
+                println!("  MCP servers: {}", running_servers.join(", "));
+            }
+        }
         println!();
     }
 
     let state = agent.run(task).await?;
+
+    // Shutdown MCP servers
+    agent.shutdown_mcp().await;
 
     // Save session messages
     for msg in &state.messages {

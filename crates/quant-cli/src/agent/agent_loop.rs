@@ -1,6 +1,7 @@
 //! Agent loop implementation
 
 use std::io::{stdout, Write};
+use std::sync::Arc;
 
 use anyhow::Result;
 use futures::StreamExt;
@@ -8,10 +9,12 @@ use llm_core::{
     ChatMessageWithTools, ChatOptions, FunctionDefinition as LlmFunctionDefinition, OllamaClient,
     Role, ToolCall as LlmToolCall, ToolDefinition as OllamaToolDefinition,
 };
+use tokio::sync::Mutex;
 use tracing::{debug, info, instrument, warn};
 
 use crate::context::{SmartContext, SmartContextSelector};
 use crate::hooks::{HookContext, HookEvent, HookManager};
+use crate::mcp::{McpManager, McpRegistryExt};
 use crate::progress::Spinner;
 use crate::project::ProjectContext;
 use crate::tools::router::{RouteResult, ToolRouter};
@@ -34,6 +37,7 @@ pub struct AgentLoop {
     config: AgentConfig,
     project_context: Option<ProjectContext>,
     hook_manager: HookManager,
+    mcp_manager: Arc<Mutex<McpManager>>,
 }
 
 impl AgentLoop {
@@ -68,13 +72,112 @@ impl AgentLoop {
             }
         }
 
+        // Initialize MCP manager
+        let mcp_manager = Arc::new(Mutex::new(McpManager::new()));
+
         Self {
             client,
             router,
             config,
             project_context,
             hook_manager,
+            mcp_manager,
         }
+    }
+
+    /// Create a new agent loop with async MCP initialization
+    pub async fn new_with_mcp(
+        client: OllamaClient,
+        mut router: ToolRouter,
+        config: AgentConfig,
+    ) -> Result<Self> {
+        // Auto-discover project context from working directory
+        let project_context = ProjectContext::discover(&config.working_dir);
+        if let Some(ref ctx) = project_context {
+            info!(
+                project = %ctx.name,
+                project_type = %ctx.project_type,
+                has_quant_md = ctx.quant_file.is_some(),
+                "Discovered project context"
+            );
+        }
+
+        // Initialize hook manager and load hooks from QUANT.md
+        let mut hook_manager = HookManager::new();
+        if let Some(ref ctx) = project_context {
+            if let Some(ref quant_file) = ctx.quant_file {
+                if let Ok(content) = std::fs::read_to_string(&quant_file.path) {
+                    match hook_manager.load_from_quant_md(&content) {
+                        Ok(count) if count > 0 => {
+                            info!(hooks = count, "Loaded hooks from QUANT.md");
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!(error = %e, "Failed to parse hooks from QUANT.md");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Initialize MCP manager and start servers from QUANT.md
+        let mut mcp_manager = McpManager::new();
+
+        if let Some(ref ctx) = project_context {
+            if let Some(ref quant_file) = ctx.quant_file {
+                if quant_file.has_mcp_servers() {
+                    info!(
+                        servers = quant_file.mcp_servers.len(),
+                        "Starting MCP servers from QUANT.md"
+                    );
+
+                    let failures = mcp_manager
+                        .start_all(quant_file.mcp_servers.clone())
+                        .await;
+
+                    if !failures.is_empty() {
+                        warn!(
+                            failed = ?failures,
+                            "Some MCP servers failed to start"
+                        );
+                    }
+
+                    // Discover tools from MCP servers and add to registry
+                    match mcp_manager.discover_tools().await {
+                        Ok(tools) => {
+                            let tool_count = tools.len();
+                            router.registry_mut().register_mcp_tools(tools);
+                            if tool_count > 0 {
+                                info!(tools = tool_count, "Registered MCP tools");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to discover MCP tools");
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            client,
+            router,
+            config,
+            project_context,
+            hook_manager,
+            mcp_manager: Arc::new(Mutex::new(mcp_manager)),
+        })
+    }
+
+    /// Get the MCP manager for external access
+    pub fn mcp_manager(&self) -> Arc<Mutex<McpManager>> {
+        Arc::clone(&self.mcp_manager)
+    }
+
+    /// Shutdown MCP servers
+    pub async fn shutdown_mcp(&self) {
+        let mut manager = self.mcp_manager.lock().await;
+        manager.stop_all().await;
     }
 
     /// Run the agent with a task
