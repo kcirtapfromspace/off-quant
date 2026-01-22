@@ -4,10 +4,26 @@ use anyhow::Result;
 use async_trait::async_trait;
 use scraper::{Html, Selector};
 use serde_json::Value;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::{debug, instrument, warn};
 
 use crate::tools::{ParameterProperty, ParameterSchema, SecurityLevel, Tool, ToolContext, ToolResult};
+
+/// Shared HTTP client for connection pooling
+static SHARED_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn get_shared_client() -> &'static reqwest::Client {
+    SHARED_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .pool_max_idle_per_host(10)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .timeout(Duration::from_secs(30))
+            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+            .build()
+            .expect("Failed to create HTTP client")
+    })
+}
 
 /// Tool for searching the web
 pub struct WebSearchTool;
@@ -48,11 +64,8 @@ impl Tool for WebSearchTool {
 
         debug!(limit, timeout_secs = ctx.http_timeout_secs, "Web search parameters");
 
-        // Use DuckDuckGo HTML search (no API key required)
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(ctx.http_timeout_secs))
-            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
-            .build()?;
+        // Use shared client for connection pooling
+        let client = get_shared_client();
 
         let search_url = format!(
             "https://html.duckduckgo.com/html/?q={}",
@@ -60,7 +73,12 @@ impl Tool for WebSearchTool {
         );
 
         debug!("Sending search request to DuckDuckGo");
-        let response = match client.get(&search_url).send().await {
+        let response = match client
+            .get(&search_url)
+            .timeout(Duration::from_secs(ctx.http_timeout_secs))
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 warn!(error = %e, "Search request failed");

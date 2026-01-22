@@ -275,6 +275,185 @@ pub struct ChatMessageWithToolCalls {
     pub tool_calls: Vec<ToolCall>,
 }
 
+impl ChatMessageWithToolCalls {
+    /// Parse tool calls from content if tool_calls is empty.
+    /// Some models output JSON tool calls in content instead of using native tool calling.
+    /// Handles various formats:
+    /// - Direct JSON: {"name": "...", "arguments": {...}}
+    /// - Code blocks: ```json\n{...}\n```
+    /// - Multiline JSON spanning multiple lines
+    /// - Mixed content with text before/after JSON
+    pub fn parse_tool_calls_from_content(&mut self) {
+        if !self.tool_calls.is_empty() {
+            return; // Already have native tool calls
+        }
+
+        // Clone content to avoid borrow issues
+        let content = self.content.trim().to_string();
+        if content.is_empty() {
+            return;
+        }
+
+        // Strategy 1: Extract from code blocks first (```json ... ``` or ``` ... ```)
+        if let Some(extracted) = Self::extract_from_code_block(&content) {
+            if self.try_parse_tool_calls(&extracted) {
+                return;
+            }
+        }
+
+        // Strategy 2: Try parsing entire content as JSON
+        if self.try_parse_tool_calls(&content) {
+            return;
+        }
+
+        // Strategy 3: Try to find JSON objects by brace matching
+        if let Some(extracted) = Self::extract_json_by_braces(&content) {
+            if self.try_parse_tool_calls(&extracted) {
+                return;
+            }
+        }
+
+        // Strategy 4: Try line-by-line parsing for single-line JSON
+        self.try_parse_line_by_line(&content);
+    }
+
+    /// Try to parse content as tool call(s), returning true if successful
+    fn try_parse_tool_calls(&mut self, content: &str) -> bool {
+        // Try as single tool call
+        if let Ok(parsed) = serde_json::from_str::<ContentToolCall>(content) {
+            self.tool_calls.push(ToolCall {
+                id: String::new(),
+                function: FunctionCall {
+                    name: parsed.name,
+                    arguments: parsed.arguments,
+                },
+            });
+            return true;
+        }
+
+        // Try as array of tool calls
+        if let Ok(parsed) = serde_json::from_str::<Vec<ContentToolCall>>(content) {
+            if !parsed.is_empty() {
+                for call in parsed {
+                    self.tool_calls.push(ToolCall {
+                        id: String::new(),
+                        function: FunctionCall {
+                            name: call.name,
+                            arguments: call.arguments,
+                        },
+                    });
+                }
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Extract JSON from markdown code blocks
+    fn extract_from_code_block(content: &str) -> Option<String> {
+        // Match ```json ... ``` or ``` ... ```
+        let patterns = ["```json\n", "```JSON\n", "```\n"];
+
+        for start_pattern in patterns {
+            if let Some(start_idx) = content.find(start_pattern) {
+                let json_start = start_idx + start_pattern.len();
+                if let Some(end_idx) = content[json_start..].find("```") {
+                    let json_content = content[json_start..json_start + end_idx].trim();
+                    if !json_content.is_empty() {
+                        return Some(json_content.to_string());
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Extract JSON by finding matching braces
+    fn extract_json_by_braces(content: &str) -> Option<String> {
+        // Find the first '{' or '[' that could start a tool call
+        let mut start_idx = None;
+        let mut is_array = false;
+
+        for (i, c) in content.char_indices() {
+            if c == '{' || c == '[' {
+                // Check if this looks like a tool call by peeking ahead
+                let remaining = &content[i..];
+                if remaining.contains("\"name\"") && remaining.contains("\"arguments\"") {
+                    start_idx = Some(i);
+                    is_array = c == '[';
+                    break;
+                }
+            }
+        }
+
+        let start = start_idx?;
+        let open_char = if is_array { '[' } else { '{' };
+        let close_char = if is_array { ']' } else { '}' };
+
+        // Count braces to find matching close
+        let mut depth = 0;
+        let mut in_string = false;
+        let mut escape_next = false;
+
+        for (i, c) in content[start..].char_indices() {
+            if escape_next {
+                escape_next = false;
+                continue;
+            }
+
+            if c == '\\' && in_string {
+                escape_next = true;
+                continue;
+            }
+
+            if c == '"' {
+                in_string = !in_string;
+                continue;
+            }
+
+            if !in_string {
+                if c == open_char {
+                    depth += 1;
+                } else if c == close_char {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(content[start..start + i + 1].to_string());
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Try parsing content line by line for single-line JSON tool calls
+    fn try_parse_line_by_line(&mut self, content: &str) {
+        for line in content.lines() {
+            let line = line.trim();
+            if line.starts_with('{') && line.contains("\"name\"") {
+                if let Ok(parsed) = serde_json::from_str::<ContentToolCall>(line) {
+                    self.tool_calls.push(ToolCall {
+                        id: String::new(),
+                        function: FunctionCall {
+                            name: parsed.name,
+                            arguments: parsed.arguments,
+                        },
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Helper struct for parsing tool calls from content
+#[derive(Debug, Deserialize)]
+struct ContentToolCall {
+    name: String,
+    arguments: serde_json::Value,
+}
+
 #[derive(Debug, Serialize)]
 struct ChatRequest {
     model: String,
@@ -770,7 +949,12 @@ impl OllamaClient {
             .error_for_status()
             .context("Chat request failed")?;
 
-        resp.json().await.context("Failed to parse chat response")
+        let mut response: ChatResponseWithTools = resp.json().await.context("Failed to parse chat response")?;
+
+        // If the model doesn't support native tool calling, try to parse tool calls from content
+        response.message.parse_tool_calls_from_content();
+
+        Ok(response)
     }
 }
 
@@ -844,6 +1028,121 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""role":"user""#));
         assert!(json.contains(r#""content":"Hello""#));
+    }
+
+    #[test]
+    fn test_parse_tool_calls_direct_json() {
+        let mut msg = ChatMessageWithToolCalls {
+            role: Role::Assistant,
+            content: r#"{"name": "file_read", "arguments": {"path": "/tmp/test.txt"}}"#.to_string(),
+            tool_calls: vec![],
+        };
+        msg.parse_tool_calls_from_content();
+        assert_eq!(msg.tool_calls.len(), 1);
+        assert_eq!(msg.tool_calls[0].function.name, "file_read");
+    }
+
+    #[test]
+    fn test_parse_tool_calls_code_block() {
+        let mut msg = ChatMessageWithToolCalls {
+            role: Role::Assistant,
+            content: r#"I'll read that file for you.
+
+```json
+{"name": "file_read", "arguments": {"path": "/tmp/test.txt"}}
+```
+"#.to_string(),
+            tool_calls: vec![],
+        };
+        msg.parse_tool_calls_from_content();
+        assert_eq!(msg.tool_calls.len(), 1);
+        assert_eq!(msg.tool_calls[0].function.name, "file_read");
+    }
+
+    #[test]
+    fn test_parse_tool_calls_multiline_json() {
+        let mut msg = ChatMessageWithToolCalls {
+            role: Role::Assistant,
+            content: r#"Let me search for that.
+
+{
+  "name": "grep",
+  "arguments": {
+    "pattern": "TODO",
+    "path": "src/"
+  }
+}"#.to_string(),
+            tool_calls: vec![],
+        };
+        msg.parse_tool_calls_from_content();
+        assert_eq!(msg.tool_calls.len(), 1);
+        assert_eq!(msg.tool_calls[0].function.name, "grep");
+    }
+
+    #[test]
+    fn test_parse_tool_calls_array() {
+        let mut msg = ChatMessageWithToolCalls {
+            role: Role::Assistant,
+            content: r#"[{"name": "glob", "arguments": {"pattern": "*.rs"}}, {"name": "grep", "arguments": {"pattern": "TODO"}}]"#.to_string(),
+            tool_calls: vec![],
+        };
+        msg.parse_tool_calls_from_content();
+        assert_eq!(msg.tool_calls.len(), 2);
+        assert_eq!(msg.tool_calls[0].function.name, "glob");
+        assert_eq!(msg.tool_calls[1].function.name, "grep");
+    }
+
+    #[test]
+    fn test_parse_tool_calls_with_surrounding_text() {
+        let mut msg = ChatMessageWithToolCalls {
+            role: Role::Assistant,
+            content: r#"I need to check the file structure first. {"name": "glob", "arguments": {"pattern": "**/*.rs"}} This should help us understand the codebase."#.to_string(),
+            tool_calls: vec![],
+        };
+        msg.parse_tool_calls_from_content();
+        assert_eq!(msg.tool_calls.len(), 1);
+        assert_eq!(msg.tool_calls[0].function.name, "glob");
+    }
+
+    #[test]
+    fn test_parse_tool_calls_ignores_native() {
+        let mut msg = ChatMessageWithToolCalls {
+            role: Role::Assistant,
+            content: r#"{"name": "ignored", "arguments": {}}"#.to_string(),
+            tool_calls: vec![ToolCall {
+                id: "1".to_string(),
+                function: FunctionCall {
+                    name: "native_call".to_string(),
+                    arguments: serde_json::json!({}),
+                },
+            }],
+        };
+        msg.parse_tool_calls_from_content();
+        // Should not add more since native calls exist
+        assert_eq!(msg.tool_calls.len(), 1);
+        assert_eq!(msg.tool_calls[0].function.name, "native_call");
+    }
+
+    #[test]
+    fn test_parse_tool_calls_empty_content() {
+        let mut msg = ChatMessageWithToolCalls {
+            role: Role::Assistant,
+            content: "".to_string(),
+            tool_calls: vec![],
+        };
+        msg.parse_tool_calls_from_content();
+        assert!(msg.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn test_parse_tool_calls_no_tool_json() {
+        let mut msg = ChatMessageWithToolCalls {
+            role: Role::Assistant,
+            content: "Hello! How can I help you today?".to_string(),
+            tool_calls: vec![],
+        };
+        msg.parse_tool_calls_from_content();
+        assert!(msg.tool_calls.is_empty());
     }
 
     #[test]
