@@ -13,9 +13,9 @@ pub mod tailscale;
 
 pub use config::Config;
 pub use ollama::{
-    ChatChunk, ChatMessage, ChatMessageWithTools, ChatOptions, ChatResponse,
-    ChatResponseWithTools, ChatStream, FunctionCall, FunctionDefinition, Model, OllamaClient,
-    OllamaStatus, PullProgress, PullStream, RetryConfig, Role, RunningModel, ToolCall,
-    ToolDefinition,
+    ChatChunk, ChatChunkMessageWithTools, ChatChunkWithTools, ChatMessage, ChatMessageWithTools,
+    ChatOptions, ChatResponse, ChatResponseWithTools, ChatStream, ChatStreamWithTools,
+    FunctionCall, FunctionDefinition, Model, OllamaClient, OllamaStatus, PullProgress, PullStream,
+    RetryConfig, Role, RunningModel, ToolCall, ToolDefinition,
 };
 pub use tailscale::{TailscaleClient, TailscaleStatus};

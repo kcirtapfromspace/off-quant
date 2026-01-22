@@ -530,6 +530,34 @@ pub struct ChatChunkMessage {
 /// Type alias for the stream of chat chunks
 pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatChunk>> + Send>>;
 
+/// Chunk from streaming chat response with tool support
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatChunkWithTools {
+    pub model: String,
+    #[serde(default)]
+    pub message: Option<ChatChunkMessageWithTools>,
+    pub done: bool,
+    #[serde(default)]
+    pub total_duration: Option<u64>,
+    #[serde(default)]
+    pub eval_count: Option<u32>,
+    #[serde(default)]
+    pub eval_duration: Option<u64>,
+}
+
+/// Chat chunk message that may contain tool calls
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatChunkMessageWithTools {
+    pub role: Role,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCall>,
+}
+
+/// Type alias for the stream of chat chunks with tool support
+pub type ChatStreamWithTools = Pin<Box<dyn Stream<Item = Result<ChatChunkWithTools>> + Send>>;
+
 /// Type alias for the stream of pull progress
 pub type PullStream = Pin<Box<dyn Stream<Item = Result<PullProgress>> + Send>>;
 
@@ -955,6 +983,75 @@ impl OllamaClient {
         response.message.parse_tool_calls_from_content();
 
         Ok(response)
+    }
+
+    /// Send a chat message with tool support and streaming response
+    ///
+    /// Returns a stream of chunks. Tool calls typically appear in the final chunk
+    /// when `done: true`. Content is streamed incrementally.
+    pub async fn chat_stream_with_tools(
+        &self,
+        model: &str,
+        messages: &[ChatMessageWithTools],
+        tools: Option<&[ToolDefinition]>,
+        options: Option<ChatOptions>,
+    ) -> Result<ChatStreamWithTools> {
+        let url = format!("{}/api/chat", self.base_url);
+
+        let req = ChatRequestWithTools {
+            model: model.to_string(),
+            messages: messages.to_vec(),
+            stream: true, // Enable streaming
+            options,
+            tools: tools.map(|t| t.to_vec()),
+        };
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&req)
+            .send()
+            .await
+            .context("Failed to send chat request")?
+            .error_for_status()
+            .context("Chat request failed")?;
+
+        let stream = async_stream::try_stream! {
+            use futures::StreamExt as FuturesStreamExt;
+
+            let mut byte_stream = resp.bytes_stream();
+            let mut buffer = String::new();
+
+            while let Some(chunk_result) = FuturesStreamExt::next(&mut byte_stream).await {
+                let chunk: bytes::Bytes = chunk_result.context("Error reading stream")?;
+                let text = String::from_utf8_lossy(&chunk);
+                buffer.push_str(&text);
+
+                // Process complete lines (Ollama sends newline-delimited JSON)
+                while let Some(newline_pos) = buffer.find('\n') {
+                    let line = buffer[..newline_pos].trim().to_string();
+                    buffer = buffer[newline_pos + 1..].to_string();
+
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    let chat_chunk: ChatChunkWithTools = serde_json::from_str(&line)
+                        .with_context(|| format!("Failed to parse chunk: {}", line))?;
+
+                    yield chat_chunk;
+                }
+            }
+
+            // Process any remaining content in buffer
+            if !buffer.trim().is_empty() {
+                let chat_chunk: ChatChunkWithTools = serde_json::from_str(buffer.trim())
+                    .with_context(|| format!("Failed to parse final chunk: {}", buffer))?;
+                yield chat_chunk;
+            }
+        };
+
+        Ok(Box::pin(stream))
     }
 }
 
