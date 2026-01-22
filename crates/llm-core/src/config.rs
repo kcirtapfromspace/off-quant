@@ -62,6 +62,39 @@ impl Config {
         Self::load_from(Self::find_config_path()?)
     }
 
+    /// Try to load configuration, returning None if not found
+    pub fn try_load() -> Option<Self> {
+        Self::load().ok()
+    }
+
+    /// Create a minimal default configuration for when llm.toml is missing
+    pub fn default_minimal() -> Self {
+        Self {
+            ollama: OllamaConfig {
+                host: "127.0.0.1".to_string(),
+                port: 11434,
+                models_path: std::path::PathBuf::from("/tmp/ollama/models"),
+                ollama_home: std::path::PathBuf::from("/tmp/ollama"),
+            },
+            network: NetworkConfig {
+                expose_port: 8080,
+                auth_user: String::new(),
+                auth_password_hash: String::new(),
+                cors_origins: "*".to_string(),
+            },
+            models: ModelsConfig {
+                coding: String::new(),
+                chat: String::new(),
+                auto_select: AutoSelectConfig {
+                    threshold_high: 64,
+                    threshold_medium: 32,
+                },
+                local: std::collections::HashMap::new(),
+            },
+            aider: None,
+        }
+    }
+
     /// Load configuration from a specific path
     pub fn load_from(path: impl AsRef<Path>) -> Result<Self> {
         let content = std::fs::read_to_string(path.as_ref())
