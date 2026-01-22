@@ -65,6 +65,18 @@ enum Commands {
         /// System prompt
         #[arg(short, long)]
         system: Option<String>,
+
+        /// Temperature (0.0-2.0, default: 0.7)
+        #[arg(short, long)]
+        temperature: Option<f32>,
+
+        /// Max tokens to generate
+        #[arg(long)]
+        max_tokens: Option<i32>,
+
+        /// Don't print newline after response
+        #[arg(short = 'n', long)]
+        no_newline: bool,
     },
 
     /// Show Ollama status and system info
@@ -111,6 +123,16 @@ enum Commands {
         #[arg(short, long, default_value = ".env.local")]
         output: String,
     },
+
+    /// Load/warm up a model (makes subsequent queries faster)
+    Run {
+        /// Model to load
+        #[arg(short, long)]
+        model: Option<String>,
+    },
+
+    /// Show detailed version and system info
+    Info,
 }
 
 #[derive(Debug, Subcommand)]
@@ -186,9 +208,23 @@ async fn main() -> Result<()> {
             context,
             json,
             system,
+            temperature,
+            max_tokens,
+            no_newline,
         }) => {
             let prompt_text = prompt.join(" ");
-            commands::ask(&prompt_text, model, stdin, context, json, system).await
+            commands::ask(
+                &prompt_text,
+                model,
+                stdin,
+                context,
+                json,
+                system,
+                temperature,
+                max_tokens,
+                no_newline,
+            )
+            .await
         }
         Some(Commands::Status) => commands::status().await,
         Some(Commands::Models { action }) => match action {
@@ -212,6 +248,8 @@ async fn main() -> Result<()> {
         Some(Commands::Import) => commands::import().await,
         Some(Commands::Select { json }) => commands::select(json).await,
         Some(Commands::Env { output }) => commands::env(&output).await,
+        Some(Commands::Run { model }) => commands::run(model).await,
+        Some(Commands::Info) => commands::info().await,
         None => {
             // Default to chat REPL when no command specified
             repl::run(None, None, None).await
