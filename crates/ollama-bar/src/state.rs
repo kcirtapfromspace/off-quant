@@ -368,3 +368,20 @@ impl AppState {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ollama_log_path() {
+        let path = AppState::ollama_log_path();
+        assert_eq!(path.to_string_lossy(), "/tmp/ollama.log");
+    }
+
+    #[test]
+    fn test_ollama_log_path_is_absolute() {
+        let path = AppState::ollama_log_path();
+        assert!(path.is_absolute());
+    }
+}
