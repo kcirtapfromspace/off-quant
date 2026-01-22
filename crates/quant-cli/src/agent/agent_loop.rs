@@ -11,6 +11,7 @@ use llm_core::{
 use tracing::{debug, info, instrument, warn};
 
 use crate::context::{SmartContext, SmartContextSelector};
+use crate::hooks::{HookContext, HookEvent, HookManager};
 use crate::progress::Spinner;
 use crate::project::ProjectContext;
 use crate::tools::router::{RouteResult, ToolRouter};
@@ -32,6 +33,7 @@ pub struct AgentLoop {
     router: ToolRouter,
     config: AgentConfig,
     project_context: Option<ProjectContext>,
+    hook_manager: HookManager,
 }
 
 impl AgentLoop {
@@ -48,11 +50,30 @@ impl AgentLoop {
             );
         }
 
+        // Initialize hook manager and load hooks from QUANT.md
+        let mut hook_manager = HookManager::new();
+        if let Some(ref ctx) = project_context {
+            if let Some(ref quant_file) = ctx.quant_file {
+                if let Ok(content) = std::fs::read_to_string(&quant_file.path) {
+                    match hook_manager.load_from_quant_md(&content) {
+                        Ok(count) if count > 0 => {
+                            info!(hooks = count, "Loaded hooks from QUANT.md");
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!(error = %e, "Failed to parse hooks from QUANT.md");
+                        }
+                    }
+                }
+            }
+        }
+
         Self {
             client,
             router,
             config,
             project_context,
+            hook_manager,
         }
     }
 
@@ -61,6 +82,25 @@ impl AgentLoop {
     pub async fn run(&self, task: &str) -> Result<AgentState> {
         info!(task_len = task.len(), max_iterations = self.config.max_iterations, "Starting agent loop");
         let mut state = AgentState::new();
+
+        // Create base hook context
+        let base_hook_ctx = HookContext::new(self.config.working_dir.clone())
+            .with_task(task);
+
+        // Run agent start hooks
+        let start_results = self.hook_manager.run_hooks(
+            HookEvent::AgentStart,
+            &base_hook_ctx,
+            None,
+        ).await;
+
+        // Check if any abort_on_failure hooks failed
+        for result in &start_results {
+            if !result.success && self.hook_manager.has_aborting_hooks(HookEvent::AgentStart) {
+                state.mark_error(format!("Agent start hook '{}' failed: {:?}", result.name, result.error));
+                return Ok(state);
+            }
+        }
 
         // Select smart context based on the task
         let smart_context = self.select_smart_context(task);
@@ -103,6 +143,10 @@ impl AgentLoop {
         while !state.finished && state.iteration < self.config.max_iterations {
             state.increment_iteration();
             debug!(iteration = state.iteration, messages = state.messages.len(), "Starting iteration");
+
+            // Run iteration start hooks
+            let iter_hook_ctx = base_hook_ctx.clone().with_iteration(state.iteration);
+            self.hook_manager.run_hooks(HookEvent::IterationStart, &iter_hook_ctx, None).await;
 
             if self.config.verbose {
                 print!(
@@ -241,6 +285,12 @@ impl AgentLoop {
                     }
                 }
 
+                // Run tool_before hooks
+                let tool_hook_ctx = base_hook_ctx.clone()
+                    .with_iteration(state.iteration)
+                    .with_tool(&call.name, &call.arguments);
+                self.hook_manager.run_hooks(HookEvent::ToolBefore, &tool_hook_ctx, Some(&call.name)).await;
+
                 // Show tool execution with spinner
                 let mut tool_spinner = if self.config.verbose {
                     println!();
@@ -332,6 +382,11 @@ impl AgentLoop {
                     }
                 }
 
+                // Run tool_after hooks
+                let tool_after_ctx = tool_hook_ctx.clone()
+                    .with_tool_result(&tool_result, is_success);
+                self.hook_manager.run_hooks(HookEvent::ToolAfter, &tool_after_ctx, Some(&call.name)).await;
+
                 // Add tool result to messages
                 let tool_call_id = tool_call.id.clone();
                 state.add_message(ChatMessageWithTools::tool_result(
@@ -347,6 +402,9 @@ impl AgentLoop {
                     break;
                 }
             }
+
+            // Run iteration end hooks
+            self.hook_manager.run_hooks(HookEvent::IterationEnd, &iter_hook_ctx, None).await;
         }
 
         // Check if we hit max iterations
@@ -368,6 +426,11 @@ impl AgentLoop {
                 state.token_usage.summary()
             );
         }
+
+        // Run agent finish hooks
+        let finish_hook_ctx = base_hook_ctx.clone()
+            .with_agent_result(state.finished && state.error.is_none(), state.error.clone());
+        self.hook_manager.run_hooks(HookEvent::AgentFinish, &finish_hook_ctx, None).await;
 
         info!(
             finished = state.finished,
