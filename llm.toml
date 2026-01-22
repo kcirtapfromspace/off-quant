@@ -1,0 +1,66 @@
+# off-quant LLM configuration
+# This file is the single source of truth for model selection and settings
+
+[ollama]
+host = "127.0.0.1"
+port = 11434
+
+# External volume for model storage (GGUF files)
+models_path = "/Volumes/models"
+
+# Where Ollama stores its data (inside models_path for unified storage)
+ollama_home = "/Volumes/models/ollama"
+
+[network]
+# Caddy will expose Ollama on this port with auth
+expose_port = 8080
+
+# Basic auth credentials (change these!)
+# Generate with: htpasswd -nb user password | sed 's/\$/\$\$/g'
+auth_user = "llm"
+auth_password_hash = "$2a$14$..." # placeholder - run `just setup-auth` to configure
+
+# Allowed origins for CORS (comma-separated)
+cors_origins = "*"
+
+[models]
+# Default model for coding tasks
+coding = "local/qwen2.5-coder-7b-q4km"
+
+# Default model for chat/general tasks
+chat = "local/glm-4-9b-chat-q4k"
+
+# Model selection thresholds (GB of RAM)
+[models.auto_select]
+threshold_high = 64    # >= this: use qwen2.5-coder-7b
+threshold_medium = 32  # >= this: use deepseek-coder-6.7b
+# below threshold_medium: use starcoder2-7b
+
+[models.local]
+# Local GGUF models to import into Ollama
+# Format: name = "path_relative_to_models_path"
+
+[models.local.qwen]
+name = "local/qwen2.5-coder-7b-q4km"
+file = "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+modelfile = "modelfiles/qwen2.5-coder-7b-instruct-q4km"
+
+[models.local.deepseek]
+name = "local/deepseek-coder-6.7b-q4km"
+file = "deepseek-coder-6.7b-instruct.Q4_K_M.gguf"
+modelfile = "modelfiles/deepseek-coder-6.7b-instruct-q4km"
+
+[models.local.starcoder]
+name = "local/starcoder2-7b-q4km"
+file = "starcoder2-7b-Q4_K_M.gguf"
+modelfile = "modelfiles/starcoder2-7b-q4km"
+
+[models.local.glm]
+name = "local/glm-4-9b-chat-q4k"
+file = "glm-4-9b-chat.Q4_K.gguf"
+modelfile = "modelfiles/glm-4-9b-chat-q4k"
+
+[aider]
+model = "ollama/local/qwen2.5-coder-7b-q4km"
+auto_commits = true
+log_file = ".aider/aider.log"

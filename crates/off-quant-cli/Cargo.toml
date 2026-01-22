@@ -1,0 +1,15 @@
+[package]
+name = "off-quant-cli"
+version.workspace = true
+edition.workspace = true
+description = "CLI for local LLM inference"
+
+[[bin]]
+name = "off-quant"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+reqwest = { workspace = true, features = ["blocking", "json"] }

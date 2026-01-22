@@ -1,0 +1,52 @@
+# Caddy reverse proxy for Ollama
+# Provides authenticated access over the network
+
+{
+    # Global options
+    admin off
+    auto_https off  # Set to 'on' if you have a domain
+}
+
+# Listen on all interfaces
+:8080 {
+    # Basic auth - generate hash with: caddy hash-password
+    # Or use: htpasswd -nbB user password
+    basicauth {
+        # Default: llm / changeme (CHANGE THIS!)
+        llm $2a$14$YourHashedPasswordHere
+    }
+
+    # Reverse proxy to native Ollama
+    # host.docker.internal works on Docker Desktop for Mac
+    reverse_proxy host.docker.internal:11434 {
+        # Pass through headers
+        header_up Host {upstream_hostport}
+
+        # Health checks
+        health_uri /api/tags
+        health_interval 30s
+        health_timeout 5s
+    }
+
+    # CORS headers for API access
+    header {
+        Access-Control-Allow-Origin *
+        Access-Control-Allow-Methods "GET, POST, OPTIONS"
+        Access-Control-Allow-Headers "Authorization, Content-Type"
+    }
+
+    # Handle preflight
+    @options method OPTIONS
+    respond @options 204
+
+    # Logging
+    log {
+        output file /var/log/caddy/access.log
+        format json
+    }
+}
+
+# Health check endpoint (no auth)
+:8081 {
+    respond /health "OK" 200
+}
