@@ -475,3 +475,90 @@ impl Model {
         format!("{:.1} GB", gb)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_chat_message_constructors() {
+        let system = ChatMessage::system("You are helpful");
+        assert_eq!(system.role, Role::System);
+        assert_eq!(system.content, "You are helpful");
+
+        let user = ChatMessage::user("Hello");
+        assert_eq!(user.role, Role::User);
+        assert_eq!(user.content, "Hello");
+
+        let assistant = ChatMessage::assistant("Hi there!");
+        assert_eq!(assistant.role, Role::Assistant);
+        assert_eq!(assistant.content, "Hi there!");
+    }
+
+    #[test]
+    fn test_model_size_human() {
+        let model = Model {
+            name: "test".to_string(),
+            size: 4 * 1024 * 1024 * 1024, // 4 GB
+            digest: "abc123".to_string(),
+            modified_at: "2024-01-01".to_string(),
+            details: ModelDetails::default(),
+        };
+        assert_eq!(model.size_human(), "4.0 GB");
+    }
+
+    #[test]
+    fn test_chat_options_default() {
+        let opts = ChatOptions::default();
+        assert!(opts.temperature.is_none());
+        assert!(opts.top_p.is_none());
+        assert!(opts.num_predict.is_none());
+        assert!(opts.stop.is_none());
+    }
+
+    #[test]
+    fn test_ollama_client_new() {
+        let client = OllamaClient::new("http://localhost:11434");
+        assert_eq!(client.base_url(), "http://localhost:11434");
+    }
+
+    #[test]
+    fn test_role_serialization() {
+        let user = Role::User;
+        let serialized = serde_json::to_string(&user).unwrap();
+        assert_eq!(serialized, r#""user""#);
+
+        let deserialized: Role = serde_json::from_str(r#""assistant""#).unwrap();
+        assert_eq!(deserialized, Role::Assistant);
+    }
+
+    #[test]
+    fn test_chat_message_serialization() {
+        let msg = ChatMessage::user("Hello");
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""role":"user""#));
+        assert!(json.contains(r#""content":"Hello""#));
+    }
+
+    // Integration tests (require Ollama to be running)
+    #[cfg(feature = "integration_tests")]
+    mod integration {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_health_check() {
+            let client = OllamaClient::new("http://localhost:11434");
+            // This test will pass if Ollama is running, fail gracefully if not
+            let _result = client.health_check().await;
+        }
+
+        #[tokio::test]
+        async fn test_list_models() {
+            let client = OllamaClient::new("http://localhost:11434");
+            if client.health_check().await.unwrap_or(false) {
+                let models = client.list_models().await;
+                assert!(models.is_ok());
+            }
+        }
+    }
+}
