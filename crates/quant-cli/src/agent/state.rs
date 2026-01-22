@@ -4,6 +4,70 @@ use llm_core::ChatMessageWithTools;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::time::Duration;
+
+/// Token usage statistics for tracking LLM consumption
+#[derive(Debug, Clone, Default)]
+pub struct TokenUsage {
+    /// Total prompt/input tokens
+    pub prompt_tokens: u32,
+    /// Total completion/output tokens
+    pub completion_tokens: u32,
+    /// Total duration across all LLM calls
+    pub total_duration: Duration,
+    /// Total evaluation duration (generation time)
+    pub eval_duration: Duration,
+    /// Number of LLM calls made
+    pub call_count: u32,
+}
+
+impl TokenUsage {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record usage from a single LLM call
+    pub fn record(
+        &mut self,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        total_duration_ns: u64,
+        eval_duration_ns: u64,
+    ) {
+        self.prompt_tokens += prompt_tokens;
+        self.completion_tokens += completion_tokens;
+        self.total_duration += Duration::from_nanos(total_duration_ns);
+        self.eval_duration += Duration::from_nanos(eval_duration_ns);
+        self.call_count += 1;
+    }
+
+    /// Total tokens (prompt + completion)
+    pub fn total_tokens(&self) -> u32 {
+        self.prompt_tokens + self.completion_tokens
+    }
+
+    /// Tokens per second (based on eval duration)
+    pub fn tokens_per_second(&self) -> f64 {
+        let secs = self.eval_duration.as_secs_f64();
+        if secs > 0.0 {
+            self.completion_tokens as f64 / secs
+        } else {
+            0.0
+        }
+    }
+
+    /// Format as a human-readable summary
+    pub fn summary(&self) -> String {
+        format!(
+            "Tokens: {} prompt + {} completion = {} total | {:.1} tok/s | {} calls",
+            self.prompt_tokens,
+            self.completion_tokens,
+            self.total_tokens(),
+            self.tokens_per_second(),
+            self.call_count
+        )
+    }
+}
 
 /// Configuration for the agent
 #[derive(Debug, Clone)]
@@ -84,6 +148,8 @@ pub struct AgentState {
     pub error: Option<String>,
     /// Failure tracker for detecting infinite loops
     pub failure_tracker: FailureTracker,
+    /// Token usage tracking
+    pub token_usage: TokenUsage,
 }
 
 /// Default max consecutive failures before aborting
@@ -98,6 +164,7 @@ impl AgentState {
             final_response: None,
             error: None,
             failure_tracker: FailureTracker::new(DEFAULT_MAX_CONSECUTIVE_FAILURES),
+            token_usage: TokenUsage::new(),
         }
     }
 
@@ -105,8 +172,20 @@ impl AgentState {
     pub fn with_max_consecutive_failures(max: usize) -> Self {
         Self {
             failure_tracker: FailureTracker::new(max),
+            token_usage: TokenUsage::new(),
             ..Self::new()
         }
+    }
+
+    /// Record token usage from an LLM response
+    pub fn record_tokens(
+        &mut self,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        total_duration_ns: u64,
+        eval_duration_ns: u64,
+    ) {
+        self.token_usage.record(prompt_tokens, completion_tokens, total_duration_ns, eval_duration_ns);
     }
 
     pub fn add_message(&mut self, message: ChatMessageWithTools) {
@@ -288,5 +367,69 @@ mod tests {
     fn test_agent_state_with_failure_tracker() {
         let state = AgentState::new();
         assert_eq!(state.failure_tracker.failure_count("any"), 0);
+    }
+
+    #[test]
+    fn test_token_usage_new() {
+        let usage = TokenUsage::new();
+        assert_eq!(usage.prompt_tokens, 0);
+        assert_eq!(usage.completion_tokens, 0);
+        assert_eq!(usage.call_count, 0);
+        assert_eq!(usage.total_tokens(), 0);
+    }
+
+    #[test]
+    fn test_token_usage_record() {
+        let mut usage = TokenUsage::new();
+
+        // Record first call
+        usage.record(100, 50, 1_000_000_000, 500_000_000); // 1s total, 0.5s eval
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 50);
+        assert_eq!(usage.total_tokens(), 150);
+        assert_eq!(usage.call_count, 1);
+
+        // Record second call - tokens should accumulate
+        usage.record(200, 100, 2_000_000_000, 1_000_000_000);
+        assert_eq!(usage.prompt_tokens, 300);
+        assert_eq!(usage.completion_tokens, 150);
+        assert_eq!(usage.total_tokens(), 450);
+        assert_eq!(usage.call_count, 2);
+    }
+
+    #[test]
+    fn test_token_usage_tokens_per_second() {
+        let mut usage = TokenUsage::new();
+
+        // 100 completion tokens in 1 second eval time
+        usage.record(50, 100, 2_000_000_000, 1_000_000_000);
+        assert!((usage.tokens_per_second() - 100.0).abs() < 0.01);
+
+        // Zero eval time should return 0 tok/s
+        let empty = TokenUsage::new();
+        assert_eq!(empty.tokens_per_second(), 0.0);
+    }
+
+    #[test]
+    fn test_token_usage_summary() {
+        let mut usage = TokenUsage::new();
+        usage.record(100, 50, 1_000_000_000, 500_000_000);
+
+        let summary = usage.summary();
+        assert!(summary.contains("100 prompt"));
+        assert!(summary.contains("50 completion"));
+        assert!(summary.contains("150 total"));
+        assert!(summary.contains("1 calls"));
+    }
+
+    #[test]
+    fn test_agent_state_token_tracking() {
+        let mut state = AgentState::new();
+        assert_eq!(state.token_usage.total_tokens(), 0);
+
+        state.record_tokens(100, 50, 1_000_000_000, 500_000_000);
+        assert_eq!(state.token_usage.prompt_tokens, 100);
+        assert_eq!(state.token_usage.completion_tokens, 50);
+        assert_eq!(state.token_usage.call_count, 1);
     }
 }

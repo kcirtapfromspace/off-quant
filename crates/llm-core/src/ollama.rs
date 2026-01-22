@@ -539,6 +539,10 @@ pub struct ChatChunkWithTools {
     pub done: bool,
     #[serde(default)]
     pub total_duration: Option<u64>,
+    /// Number of tokens in the prompt
+    #[serde(default)]
+    pub prompt_eval_count: Option<u32>,
+    /// Number of tokens generated
     #[serde(default)]
     pub eval_count: Option<u32>,
     #[serde(default)]
