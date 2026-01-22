@@ -12,7 +12,7 @@ use tracing::{debug, info, instrument, warn};
 use crate::tools::router::{RouteResult, ToolRouter};
 use crate::tools::{ToolCall, ToolContext};
 
-use super::state::{AgentConfig, AgentState};
+use super::state::{AgentConfig, AgentState, FailureTracker};
 
 // ANSI colors
 const GREEN: &str = "\x1b[92m";
@@ -154,6 +154,20 @@ impl AgentLoop {
                 };
                 debug!(tool = %call.name, "Executing tool call");
 
+                // Create signature for failure tracking
+                let signature = FailureTracker::tool_signature(&call.name, &call.arguments);
+
+                // Check if this is a repeated failing call
+                if state.failure_tracker.is_repeated_call(&signature) {
+                    let count = state.failure_tracker.failure_count(&signature);
+                    if count > 0 && self.config.verbose {
+                        println!(
+                            "{}[Warning: This tool call has failed {} time(s)]{}",
+                            YELLOW, count, RESET
+                        );
+                    }
+                }
+
                 if self.config.verbose {
                     println!();
                     print!(
@@ -165,7 +179,7 @@ impl AgentLoop {
 
                 let result = self.router.route(&call, &tool_ctx).await;
 
-                let (tool_result, should_abort) = match result {
+                let (tool_result, is_success, should_abort) = match result {
                     RouteResult::Success(r) => {
                         if self.config.verbose {
                             if r.success {
@@ -174,40 +188,62 @@ impl AgentLoop {
                                 println!("{}Failed{}", YELLOW, RESET);
                             }
                         }
-                        (r.output.clone(), false)
+                        (r.output.clone(), r.success, false)
                     }
                     RouteResult::Skipped => {
                         if self.config.verbose {
                             println!("{}Skipped{}", DIM, RESET);
                         }
-                        ("Tool execution was skipped by user".to_string(), false)
+                        ("Tool execution was skipped by user".to_string(), false, false)
                     }
                     RouteResult::Denied => {
                         if self.config.verbose {
                             println!("{}Denied{}", YELLOW, RESET);
                         }
-                        ("Tool execution was denied by user".to_string(), false)
+                        ("Tool execution was denied by user".to_string(), false, false)
                     }
                     RouteResult::Aborted => {
                         if self.config.verbose {
                             println!("{}Aborted{}", YELLOW, RESET);
                         }
                         state.mark_error("Operation aborted by user".to_string());
-                        ("Operation aborted".to_string(), true)
+                        ("Operation aborted".to_string(), false, true)
                     }
                     RouteResult::NotFound(name) => {
                         if self.config.verbose {
                             println!("{}Not found{}", YELLOW, RESET);
                         }
-                        (format!("Tool not found: {}", name), false)
+                        (format!("Tool not found: {}", name), false, false)
                     }
                     RouteResult::Error(e) => {
                         if self.config.verbose {
                             println!("{}Error{}", YELLOW, RESET);
                         }
-                        (format!("Tool error: {}", e), false)
+                        (format!("Tool error: {}", e), false, false)
                     }
                 };
+
+                // Track success/failure for loop detection
+                if is_success {
+                    state.failure_tracker.record_success(&signature);
+                } else {
+                    if let Some(abort_reason) = state.failure_tracker.record_failure(&signature, &tool_result) {
+                        warn!(
+                            tool = %call.name,
+                            failures = state.failure_tracker.failure_count(&signature),
+                            "Aborting due to consecutive failures"
+                        );
+                        if self.config.verbose {
+                            println!();
+                            println!(
+                                "{}[Abort]{} {}",
+                                YELLOW, RESET, abort_reason
+                            );
+                        }
+                        state.mark_error(abort_reason);
+                        break;
+                    }
+                }
 
                 // Add tool result to messages
                 let tool_call_id = tool_call.id.clone();
