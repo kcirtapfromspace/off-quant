@@ -1,2 +1,32 @@
 /target
 /models
+.env.local
+.aider/
+.aider*
+
+# Build artifacts
+/dist/
+
+# Logs
+*.log
+/tmp/
+
+# Python
+__pycache__/
+*.pyc
+
+# Caddy
+caddy_data/
+caddy_logs/
+
+# Icon build artifacts (keep .icns)
+assets/*.iconset/
+
+# macOS
+.DS_Store
+*.dSYM/
+
+# IDE
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,48 @@
+# Docker Compose for network proxy services
+# Ollama runs natively on the host for Metal GPU acceleration
+# This file provides network exposure and optional services
+
+services:
+  # Reverse proxy with authentication
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "8080:8080"   # Authenticated API
+      - "8081:8081"   # Health check (no auth)
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_logs:/var/log/caddy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8081/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Aider coding assistant (manual run)
+  aider:
+    build:
+      context: .
+      dockerfile: Dockerfile.aider
+    image: off-quant/aider:local
+    profiles: ["manual"]
+    working_dir: /repo
+    env_file:
+      - .env.local
+    environment:
+      # Connect to host Ollama
+      OLLAMA_API_BASE: "http://host.docker.internal:11434"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - .:/repo
+      - /Volumes/models:/models:ro
+    stdin_open: true
+    tty: true
+
+volumes:
+  caddy_data:
+  caddy_logs:
