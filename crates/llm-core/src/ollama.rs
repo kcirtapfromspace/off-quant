@@ -122,6 +122,7 @@ pub enum Role {
     System,
     User,
     Assistant,
+    Tool,
 }
 
 /// A single chat message
@@ -152,6 +153,126 @@ impl ChatMessage {
             content: content.into(),
         }
     }
+
+    pub fn tool(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+        }
+    }
+}
+
+/// Tool definition for Ollama API
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    /// Tool type (always "function")
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    /// Function definition
+    pub function: FunctionDefinition,
+}
+
+/// Function definition within a tool
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionDefinition {
+    /// Function name
+    pub name: String,
+    /// Function description
+    pub description: String,
+    /// Parameter schema (JSON Schema object)
+    pub parameters: serde_json::Value,
+}
+
+/// A tool call from the assistant
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    /// Tool call ID (for tracking)
+    #[serde(default)]
+    pub id: String,
+    /// Function being called
+    pub function: FunctionCall,
+}
+
+/// Function call details
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionCall {
+    /// Function name
+    pub name: String,
+    /// Arguments as JSON string or object
+    pub arguments: serde_json::Value,
+}
+
+/// Extended chat message that can include tool calls
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessageWithTools {
+    /// Message role
+    pub role: Role,
+    /// Message content (may be empty if tool_calls present)
+    #[serde(default)]
+    pub content: String,
+    /// Tool calls from assistant
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// Tool call ID for tool responses
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl ChatMessageWithTools {
+    pub fn from_message(msg: &ChatMessage) -> Self {
+        Self {
+            role: msg.role.clone(),
+            content: msg.content.clone(),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id.into()),
+        }
+    }
+
+    pub fn to_message(&self) -> ChatMessage {
+        ChatMessage {
+            role: self.role.clone(),
+            content: self.content.clone(),
+        }
+    }
+}
+
+/// Response from chat with tools
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatResponseWithTools {
+    pub model: String,
+    pub message: ChatMessageWithToolCalls,
+    pub done: bool,
+    #[serde(default)]
+    pub total_duration: u64,
+    #[serde(default)]
+    pub load_duration: u64,
+    #[serde(default)]
+    pub prompt_eval_count: u32,
+    #[serde(default)]
+    pub prompt_eval_duration: u64,
+    #[serde(default)]
+    pub eval_count: u32,
+    #[serde(default)]
+    pub eval_duration: u64,
+}
+
+/// Message in tool response that includes tool_calls
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatMessageWithToolCalls {
+    pub role: Role,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCall>,
 }
 
 #[derive(Debug, Serialize)]
@@ -161,6 +282,17 @@ struct ChatRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<ChatOptions>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatRequestWithTools {
+    model: String,
+    messages: Vec<ChatMessageWithTools>,
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<ChatOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ToolDefinition>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -607,6 +739,38 @@ impl OllamaClient {
     /// Get the base URL
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Send a chat message with tool support (non-streaming)
+    pub async fn chat_with_tools(
+        &self,
+        model: &str,
+        messages: &[ChatMessageWithTools],
+        tools: Option<&[ToolDefinition]>,
+        options: Option<ChatOptions>,
+    ) -> Result<ChatResponseWithTools> {
+        let url = format!("{}/api/chat", self.base_url);
+
+        let req = ChatRequestWithTools {
+            model: model.to_string(),
+            messages: messages.to_vec(),
+            stream: false,
+            options,
+            tools: tools.map(|t| t.to_vec()),
+        };
+
+        let resp = self
+            .client
+            .post(&url)
+            .json(&req)
+            .timeout(Duration::from_secs(300))
+            .send()
+            .await
+            .context("Failed to send chat request")?
+            .error_for_status()
+            .context("Chat request failed")?;
+
+        resp.json().await.context("Failed to parse chat response")
     }
 }
 
