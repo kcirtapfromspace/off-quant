@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.1.2](https://github.com/kcirtapfromspace/off-quant/compare/off-quant-v0.1.1...off-quant-v0.1.2) (2026-02-13)
+
+
+### Features
+
+* add config helpers and context token tracking ([38f0d97](https://github.com/kcirtapfromspace/off-quant/commit/38f0d974239048cdd6f2b2e886077486bb79b4d4))
+* add OllamaBar macOS menu bar app with CI/CD ([4e66a80](https://github.com/kcirtapfromspace/off-quant/commit/4e66a80d5838570a10d0a195921a24eb4cda5d85))
+* add streaming pull, retry logic, and menu bar rate limiting ([5759941](https://github.com/kcirtapfromspace/off-quant/commit/5759941e658dd00ea87623e462a295cc65d782f2))
+* add unified quant CLI with streaming chat and REPL ([9f263f7](https://github.com/kcirtapfromspace/off-quant/commit/9f263f77837067c31e9164449c65cf3824edb8e7))
+* **llm-core:** add streaming support for tool-enabled chat ([3f34069](https://github.com/kcirtapfromspace/off-quant/commit/3f340692a87f1342d84f2017ed68a32ed52cc42e))
+* **quant-cli:** add Claude Code parity features ([edbe4cd](https://github.com/kcirtapfromspace/off-quant/commit/edbe4cd1034f22ae0b25cefa2b1eb70e8c986b4c))
+* **quant-cli:** add MCP client support and smart context management ([164f286](https://github.com/kcirtapfromspace/off-quant/commit/164f28692a192ae12576eb584eb6658680be441a))
+* **quant-cli:** add P1 features - multi-edit, sandbox, hooks ([6a8a57b](https://github.com/kcirtapfromspace/off-quant/commit/6a8a57b9a578837ca317108bb032b3aa1ecd3e7c))
+* **quant-cli:** add robustness improvements and documentation ([9e8d787](https://github.com/kcirtapfromspace/off-quant/commit/9e8d787c10a49906f14b642d3563ae2572f9ab3a))
+* **quant-cli:** add temperature, max_tokens, run, and info commands ([01d128c](https://github.com/kcirtapfromspace/off-quant/commit/01d128cdd6e9b341df1b07d4584681477429cc84))
+* **quant-cli:** add token usage tracking for agent loop ([a282cff](https://github.com/kcirtapfromspace/off-quant/commit/a282cff2e6401a619aaf3ce294d6e16d97accdd8))
+* **quant-cli:** add tool framework for agent-based execution ([45bde36](https://github.com/kcirtapfromspace/off-quant/commit/45bde36cf186d0d07f82d0dd3ebe24cf210d905c))
+* **quant-cli:** add user config and shell completions ([a771a4e](https://github.com/kcirtapfromspace/off-quant/commit/a771a4e317d94980b69f8bf466d4a416a8d495d0))
+
+
+### Bug Fixes
+
+* correct GitHub Actions workflow configurations ([df4d19f](https://github.com/kcirtapfromspace/off-quant/commit/df4d19feba7d02d8e871ce2d7f666e8dfe763780))
+* format code and suppress unused code warnings ([a605264](https://github.com/kcirtapfromspace/off-quant/commit/a605264cffbdc582c2eb7291eba4a5d88518b7fa))
+* **quant-cli:** add JSON tool call parsing fallback for models ([e71242b](https://github.com/kcirtapfromspace/off-quant/commit/e71242b701ffc341a95038e8a9cb95f16c404d13))
+* **quant-cli:** security hardening and observability for tool framework ([054ed2f](https://github.com/kcirtapfromspace/off-quant/commit/054ed2f51193e8777a3d7a21b645d7d723009417))
+* use simple release type for cargo workspace ([60a8da7](https://github.com/kcirtapfromspace/off-quant/commit/60a8da70ec08beee2c54cfb69d503c1ce94f367c))
+
+
+### Documentation
+
+* update README with quant CLI and improved architecture ([7096a39](https://github.com/kcirtapfromspace/off-quant/commit/7096a39f647c52ee91e59c87dcafd00c1d79510b))
+
 ## [0.1.1](https://github.com/kcirtapfromspace/off-quant/compare/off-quant-v0.1.0...off-quant-v0.1.1) (2026-01-22)
 
 
